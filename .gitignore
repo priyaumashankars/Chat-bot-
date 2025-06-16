@@ -1,0 +1,13 @@
+# Ignore environment variables and secrets
+.env
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore Chainlit runtime artifacts
+uploads/
+.chainlit/
+
+# VS Code settings (optional)
+.vscode/
