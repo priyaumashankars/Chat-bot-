@@ -88,6 +88,7 @@ class DatabaseManager:
             # Create indexes for better performance
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_status ON doc_data(doc_status)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_doc_id ON faq_data(doc_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_document_status_doc_id ON document_status(doc_id)")
            
             print("Database tables initialized")
            
@@ -96,19 +97,50 @@ class DatabaseManager:
             raise
         finally:
             await conn.close()
+
+    async def update_document_status(self, doc_id, status):
+        """Update or insert document status in document_status table"""
+        conn = await get_db_connection()
+        try:
+            doc_id = int(doc_id)
+            status = str(status)
+            
+            # Check if status record exists
+            existing = await conn.fetchrow("SELECT id FROM document_status WHERE doc_id = $1", doc_id)
+            
+            if existing:
+                # Update existing record
+                await conn.execute("""
+                    UPDATE document_status 
+                    SET doc_status = $1, updated_at = $2 
+                    WHERE doc_id = $3
+                """, status, datetime.now(), doc_id)
+            else:
+                # Insert new record
+                await conn.execute("""
+                    INSERT INTO document_status (doc_id, doc_status, updated_at)
+                    VALUES ($1, $2, $3)
+                """, doc_id, status, datetime.now())
+                
+        except Exception as e:
+            print(f"Error updating document status: {e}")
+        finally:
+            await conn.close()
  
     async def get_all_documents(self):
         """Get all documents with their processing status"""
         conn = await get_db_connection()
         try:
             docs = await conn.fetch("""
-                SELECT id, doc_name, doc_status, 
-                       COALESCE(file_size, 0) as file_size, 
-                       COALESCE(total_faqs, 0) as total_faqs,
-                       COALESCE(processing_time, 0) as processing_time,
-                       created_at, processed_at, error_message, uploaded_by
-                FROM doc_data
-                ORDER BY created_at DESC
+                SELECT dd.id, dd.doc_name, dd.doc_status, 
+                       COALESCE(dd.file_size, 0) as file_size, 
+                       COALESCE(dd.total_faqs, 0) as total_faqs,
+                       COALESCE(dd.processing_time, 0) as processing_time,
+                       dd.created_at, dd.processed_at, dd.error_message, dd.uploaded_by,
+                       ds.doc_status as status_table_status, ds.updated_at as status_updated_at
+                FROM doc_data dd
+                LEFT JOIN document_status ds ON dd.id = ds.doc_id
+                ORDER BY dd.created_at DESC
             """)
             return [dict(doc) for doc in docs]
         except Exception as e:
@@ -143,7 +175,7 @@ class DatabaseManager:
             await conn.execute("DELETE FROM faq_data WHERE doc_id = $1", doc_id)
             print(f"Deleted {faq_count} FAQs for document {doc_id}")
            
-            # Delete from document_status table if exists
+            # Delete from document_status table
             await conn.execute("DELETE FROM document_status WHERE doc_id = $1", doc_id)
            
             # Delete document record
@@ -320,6 +352,11 @@ async def start():
                
                 doc_list += f"{status_emoji} **ID: {doc.get('id', 'N/A')} - {doc.get('doc_name', 'Unknown')}**\n"
                 doc_list += f"   📊 Status: {doc.get('doc_status', 'unknown').title()}\n"
+                
+                # Show status table info if available
+                if doc.get('status_table_status'):
+                    doc_list += f"   🔄 Status Table: {doc.get('status_table_status', 'N/A')}\n"
+                
                 doc_list += f"   🤖 FAQs: {doc.get('total_faqs', 0)}\n"
                 
                 if doc.get('created_at'):
@@ -472,6 +509,9 @@ async def process_pdf_upload(file_path, filename):
        
         # Ensure doc_id is integer
         doc_id = int(doc_id)
+        
+        # Update document_status table
+        await db_manager.update_document_status(doc_id, 'processing')
        
         # Extract text from PDF
         text = DocumentProcessor.extract_text_from_pdf(permanent_path)
@@ -482,6 +522,9 @@ async def process_pdf_upload(file_path, filename):
                 SET doc_status = $1, error_message = $2, processed_at = $3
                 WHERE id = $4
             """, 'failed', 'Could not extract sufficient text from PDF', datetime.now(), doc_id)
+            
+            # Update document_status table
+            await db_manager.update_document_status(doc_id, 'failed')
             return False
        
         # Update document with extracted text
@@ -496,6 +539,9 @@ async def process_pdf_upload(file_path, filename):
                 SET doc_status = $1, error_message = $2, processed_at = $3
                 WHERE id = $4
             """, 'failed', 'Could not generate FAQs from document content', datetime.now(), doc_id)
+            
+            # Update document_status table
+            await db_manager.update_document_status(doc_id, 'failed')
             return False
        
         # Store FAQs with embeddings
@@ -522,6 +568,9 @@ async def process_pdf_upload(file_path, filename):
             SET doc_status = $1, total_faqs = $2, processing_time = $3, processed_at = $4
             WHERE id = $5
         """, 'completed', stored_faqs, processing_time, datetime.now(), doc_id)
+        
+        # Update document_status table
+        await db_manager.update_document_status(doc_id, 'completed')
        
         await cl.Message(
             content=f"✅ **{filename}** processed successfully!\n🤖 Generated {stored_faqs} FAQs in {processing_time}s"
@@ -537,6 +586,9 @@ async def process_pdf_upload(file_path, filename):
                 SET doc_status = $1, error_message = $2, processed_at = $3
                 WHERE id = $4
             """, 'failed', str(e), datetime.now(), doc_id)
+            
+            # Update document_status table
+            await db_manager.update_document_status(doc_id, 'failed')
        
         await cl.Message(content=f"❌ **{filename}** processing failed: {str(e)}").send()
         return False
@@ -563,7 +615,13 @@ async def show_document_status():
         }.get(doc.get('doc_status', 'unknown'), '❓')
        
         status_msg += f"**ID {doc.get('id', 'N/A')}**: {status_emoji} {doc.get('doc_name', 'Unknown')}\n"
-        status_msg += f"   📊 Status: {doc.get('doc_status', 'unknown').title()}\n"
+        status_msg += f"   📊 Main Status: {doc.get('doc_status', 'unknown').title()}\n"
+        
+        # Show status table info if available
+        if doc.get('status_table_status'):
+            status_msg += f"   🔄 Status Table: {doc.get('status_table_status', 'N/A')}\n"
+            if doc.get('status_updated_at'):
+                status_msg += f"   🕒 Status Updated: {doc['status_updated_at'].strftime('%Y-%m-%d %H:%M')}\n"
         
         # Safe handling of file_size
         file_size = doc.get('file_size', 0)
@@ -594,6 +652,7 @@ async def show_processing_stats():
     """Show processing statistics"""
     conn = await get_db_connection()
     try:
+        # Get stats from both tables
         stats = await conn.fetchrow("""
             SELECT
                 COUNT(*) as total_docs,
@@ -605,6 +664,16 @@ async def show_processing_stats():
                 COALESCE(SUM(file_size), 0) as total_file_size
             FROM doc_data
         """)
+        
+        # Get status table stats
+        status_stats = await conn.fetchrow("""
+            SELECT
+                COUNT(*) as status_records,
+                COUNT(*) FILTER (WHERE doc_status = 'completed') as status_completed,
+                COUNT(*) FILTER (WHERE doc_status = 'failed') as status_failed,
+                COUNT(*) FILTER (WHERE doc_status = 'processing') as status_processing
+            FROM document_status
+        """)
        
         # Safe handling of stats with default values
         total_docs = stats.get('total_docs', 0)
@@ -615,6 +684,11 @@ async def show_processing_stats():
         avg_processing_time = stats.get('avg_processing_time', 0)
         total_file_size = stats.get('total_file_size', 0)
         
+        status_records = status_stats.get('status_records', 0)
+        status_completed = status_stats.get('status_completed', 0)
+        status_failed = status_stats.get('status_failed', 0)
+        status_processing = status_stats.get('status_processing', 0)
+        
         success_rate = (completed_docs / max(total_docs, 1) * 100) if total_docs > 0 else 0
         
         stats_msg = f"""📊 **Processing Statistics:**
@@ -623,6 +697,11 @@ async def show_processing_stats():
 ✅ **Completed:** {completed_docs}
 ❌ **Failed:** {failed_docs}
 🔄 **Processing:** {processing_docs}
+ 
+📋 **Status Table Records:** {status_records}
+   ✅ Status Completed: {status_completed}
+   ❌ Status Failed: {status_failed}
+   🔄 Status Processing: {status_processing}
  
 🤖 **Total FAQs Generated:** {total_faqs}
 ⏱️ **Average Processing Time:** {avg_processing_time:.1f}s
@@ -655,8 +734,7 @@ async def delete_document(doc_id):
                 return
         finally:
             await conn.close()
-        
-        # Show confirmation and proceed with deletion
+            # Show confirmation and proceed with deletion
         await cl.Message(content=f"🗑️ **Deleting document:** {doc['doc_name']} (ID: {doc_id})...").send()
         
         # Perform deletion
@@ -734,3 +812,4 @@ if __name__ == "__main__":
     print(f"Database URL: {'✅ Configured' if DATABASE_URL else '❌ Missing'}")
     print(f"OpenAI API Key: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
     print(f"Upload Folder: {UPLOAD_FOLDER}")
+    
