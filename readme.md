@@ -1,4 +1,4 @@
-Policy Assistant
+Policy Assistant:
 A web-based application for managing and querying policy documents using a conversational AI interface powered by OpenAI. Supports PDF uploads, FAQ generation, and semantic search.
 Features
 
@@ -23,15 +23,13 @@ PyPDF2 for PDF text extraction.
 
 
 
-Prerequisites
-
+Prerequisites:
 Python 3.8+
 PostgreSQL
 OpenAI API key
 Dependencies in requirements.txt
 
-Installation
-
+Installation:
 Clone repo: git clone https://github.com/your-username/policy-assistant.git
 Set up virtual environment: python -m venv venv && source venv/bin/activate
 Install dependencies: pip install -r requirements.txt
@@ -46,26 +44,23 @@ Admin panel: chainlit run admin.py
 
 
 
-Usage
-
+Usage:
 User Interface: Access at http://localhost:8000, query policies, select policies, or download files.
 Admin Panel: Upload PDFs, manage documents, and view stats at http://localhost:8000.
 
-Database Schema
-
+Database Schema:
 faq_data: Questions, answers, embeddings, document/company IDs.
 doc_data: Document metadata, content, status.
 chat_sessions/chat_messages: User session and conversation history.
 companies: Company names and codes.
 document_status: Document processing status.
 
-Contributing
-
+Contributing:
 Fork and create a feature branch.
 Commit changes and push.
 Open a pull request.
 
-License
+License:
 MIT License (see LICENSE).
 Contact
 Open an issue on GitHub for support.
