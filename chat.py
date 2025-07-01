@@ -196,6 +196,7 @@ class DatabaseManager:
                     id SERIAL PRIMARY KEY,
                     session_id VARCHAR(255) UNIQUE NOT NULL,
                     doc_id INTEGER,
+                    client_type VARCHAR(50) DEFAULT 'web',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -207,6 +208,7 @@ class DatabaseManager:
                     session_id VARCHAR(255) NOT NULL,
                     role VARCHAR(50) NOT NULL,
                     message TEXT NOT NULL,
+                    message_type VARCHAR(50) DEFAULT 'user_message',
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -250,7 +252,7 @@ class DatabaseManager:
             if conn:
                 await connection_pool.release(conn)
 
-    async def store_message(self, session_id: str, role: str, message: str) -> bool:
+    async def store_message(self, session_id: str, role: str, message: str, message_type: str = 'user_message') -> bool:
         conn = None
         try:
             conn = await get_db_connection()
@@ -261,11 +263,13 @@ class DatabaseManager:
             )
            
             if not session_exists:
+                client_type = 'copilot' if cl.context.session.client_type == 'copilot' else 'web'
+                
                 await conn.execute("""
-                    INSERT INTO chat_sessions (session_id, doc_id, created_at, last_activity)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (session_id) DO UPDATE SET last_activity = $4
-                """, session_id, None, datetime.now(), datetime.now())
+                    INSERT INTO chat_sessions (session_id, doc_id, client_type, created_at, last_activity)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (session_id) DO UPDATE SET last_activity = $5
+                """, session_id, None, client_type, datetime.now(), datetime.now())
             else:
                 await conn.execute("""
                     UPDATE chat_sessions
@@ -274,9 +278,9 @@ class DatabaseManager:
                 """, datetime.now(), session_id)
            
             await conn.execute("""
-                INSERT INTO chat_messages (session_id, role, message, timestamp)
-                VALUES ($1, $2, $3, $4)
-            """, session_id, role, message, datetime.now())
+                INSERT INTO chat_messages (session_id, role, message, message_type, timestamp)
+                VALUES ($1, $2, $3, $4, $5)
+            """, session_id, role, message, message_type, datetime.now())
            
             return True
            
@@ -292,7 +296,7 @@ class DatabaseManager:
             conn = await get_db_connection()
            
             history_rows = await conn.fetch("""
-                SELECT role, message, timestamp FROM chat_messages
+                SELECT role, message, message_type, timestamp FROM chat_messages
                 WHERE session_id = $1
                 ORDER BY timestamp DESC
                 LIMIT $2
@@ -302,6 +306,7 @@ class DatabaseManager:
                 {
                     'role': row['role'],
                     'message': row['message'],
+                    'message_type': row['message_type'],
                     'timestamp': row['timestamp']
                 }
                 for row in reversed(history_rows)
@@ -315,18 +320,19 @@ class DatabaseManager:
             if conn:
                 await connection_pool.release(conn)
 
-    async def create_session(self, session_id: str, doc_id: Optional[int] = None) -> bool:
+    async def create_session(self, session_id: str, doc_id: Optional[int] = None, client_type: str = 'web') -> bool:
         conn = None
         try:
             conn = await get_db_connection()
            
             await conn.execute("""
-                INSERT INTO chat_sessions (session_id, doc_id, created_at, last_activity)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO chat_sessions (session_id, doc_id, client_type, created_at, last_activity)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (session_id) DO UPDATE SET
-                    last_activity = $4,
-                    doc_id = COALESCE($2, chat_sessions.doc_id)
-            """, session_id, doc_id, datetime.now(), datetime.now())
+                    last_activity = $5,
+                    doc_id = COALESCE($2, chat_sessions.doc_id),
+                    client_type = $3
+            """, session_id, doc_id, client_type, datetime.now(), datetime.now())
            
             return True
            
@@ -382,7 +388,6 @@ class DatabaseManager:
                 await connection_pool.release(conn)
 
     async def get_policy_details_by_name(self, doc_name: str) -> Optional[Dict]:
-        """Get policy details including name, path, and ID by name."""
         conn = None
         try:
             conn = await get_db_connection()
@@ -500,7 +505,7 @@ class ChatbotEngine:
             if conn:
                 await connection_pool.release(conn)
    
-    async def generate_response(self, question, conversation_history, doc_id=None):
+    async def generate_response(self, question, conversation_history, doc_id=None, is_copilot=False):
         conn = None
         try:
             conn = await get_db_connection()
@@ -545,20 +550,33 @@ class ChatbotEngine:
             if conversation_history:
                 history_text = "Previous conversation:\n"
                 for msg in conversation_history[-6:]:
-                    role = "User" if msg['role'] == 'user' else "Assistant"
-                    history_text += f"{role}: {msg['message']}\n"
+                    if msg['message_type'] != 'system_message':
+                        role = "User" if msg['role'] == 'user' else "Assistant"
+                        history_text += f"{role}: {msg['message']}\n"
                 history_text += "\n"
            
-            system_prompt = """You are a helpful AI assistant that answers questions based on uploaded PDF documents.
-           
-            Guidelines:
-            1. Be conversational and friendly
-            2. If you have relevant information from the document, use it to answer
-            3. If the question is not covered in the document, politely say so and offer general help
-            4. Maintain context from the conversation history
-            5. Ask follow-up questions when appropriate
-            6. Be concise but informative
-            7. Always be helpful and engaging"""
+            if is_copilot:
+                system_prompt = """You are an AI assistant integrated as a copilot in a policy management system.
+               
+                Guidelines:
+                1. Be concise and actionable - users expect quick, focused responses in copilot mode
+                2. Prioritize direct answers over explanatory text
+                3. If you have relevant policy information, provide specific details
+                4. For complex queries, break down the response into key points
+                5. Suggest specific actions when appropriate (e.g., "download policy X", "check section Y")
+                6. Be contextually aware of the user's current task
+                7. Keep responses under 200 words unless more detail is specifically requested"""
+            else:
+                system_prompt = """You are a helpful AI assistant that answers questions based on uploaded PDF documents.
+               
+                Guidelines:
+                1. Be conversational and friendly
+                2. If you have relevant information from the document, use it to answer
+                3. If the question is not covered in the document, politely say so and offer general help
+                4. Maintain context from the conversation history
+                5. Ask follow-up questions when appropriate
+                6. Be concise but informative
+                7. Always be helpful and engaging"""
            
             user_prompt = f"""
             {history_text}
@@ -567,7 +585,7 @@ class ChatbotEngine:
            
             Current question: {question}
            
-            Please provide a helpful, conversational response based on the available information."""
+            Please provide a helpful{',' if is_copilot else ', conversational'} response based on the available information."""
            
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -575,7 +593,7 @@ class ChatbotEngine:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                max_tokens=800,
+                max_tokens=600 if is_copilot else 800,
                 temperature=0.7,
             )
             return response.choices[0].message.content.strip()
@@ -590,6 +608,27 @@ class ChatbotEngine:
 db_manager = DatabaseManager()
 chatbot = ChatbotEngine(OPENAI_API_KEY)
 
+# Copilot Function Handlers
+@cl.action_callback("download_policy")
+async def handle_download_action(action):
+    policy_name = action.value
+    session_id = cl.user_session.get("session_id")
+    
+    if session_id and policy_name:
+        await download_policy_file(policy_name, session_id, is_copilot=True)
+    else:
+        await cl.Message(content="❌ Unable to download policy. Please try again.").send()
+
+@cl.action_callback("select_policy")
+async def handle_select_action(action):
+    policy_name = action.value
+    session_id = cl.user_session.get("session_id")
+    
+    if session_id and policy_name:
+        await handle_policy_selection_by_name(policy_name, is_copilot=True)
+    else:
+        await cl.Message(content="❌ Unable to select policy. Please try again.").send()
+
 @cl.on_chat_start
 async def start():
     try:
@@ -600,39 +639,59 @@ async def start():
         cl.user_session.set("doc_id", None)
         cl.user_session.set("doc_name", None)
         
-        success = await db_manager.create_session(session_id)
+        is_copilot = cl.context.session.client_type == "copilot"
+        client_type = "copilot" if is_copilot else "web"
+        
+        success = await db_manager.create_session(session_id, client_type=client_type)
         available_docs = await chatbot.get_available_documents()
         
-        if available_docs:
-            # Create policy options for the select widget
-            policy_options = ["All Policies (Search across all)"]
-            policy_options.extend([f"{doc['doc_name']} ({doc.get('faq_count', 0)} FAQs)" for doc in available_docs])
-            
-            # Create the settings with policy selector
-            settings = await cl.ChatSettings(
-                [
-                    Select(
-                        id="PolicySelector",
-                        label="📚 Select Policy",
-                        values=policy_options,
-                        initial_index=0,
-                    )
-                ]
-            ).send()
-            
-            # Store available docs in session for later use
-            cl.user_session.set("available_docs", available_docs)
-            
-            # Process initial selection
-            selected_policy = settings.get("PolicySelector", policy_options[0])
-            await handle_policy_widget_selection(selected_policy)
-            
-            docs_list = "\n".join([
-                f"• **{doc['doc_name']}** ({doc.get('faq_count', 0)} FAQs) - Status: {doc.get('doc_status', 'unknown')} - Updated: {safe_strftime(doc.get('updated_at'), default='Never')}"
-                for doc in available_docs
-            ])
-            
-            welcome_message = f"""👋 **Welcome to the Policy Assistant!**
+        if is_copilot:
+            if available_docs:
+                docs_summary = f"{len(available_docs)} policies available"
+                welcome_message = f"""🤖 **Policy Copilot Ready**
+
+📚 **Status:** {docs_summary}
+
+**Quick Commands:**
+• Ask about any policy
+• Type policy names for quick access
+• Request downloads or summaries
+
+**Ready to help!** 🚀"""
+            else:
+                welcome_message = """🤖 **Policy Copilot**
+
+❌ No policies currently available.
+
+Contact your administrator to upload policies."""
+        
+        else:
+            if available_docs:
+                policy_options = ["All Policies (Search across all)"]
+                policy_options.extend([f"{doc['doc_name']} ({doc.get('faq_count', 0)} FAQs)" for doc in available_docs])
+                
+                settings = await cl.ChatSettings(
+                    [
+                        Select(
+                            id="PolicySelector",
+                            label="📚 Select Policy",
+                            values=policy_options,
+                            initial_index=0,
+                        )
+                    ]
+                ).send()
+                
+                cl.user_session.set("available_docs", available_docs)
+                
+                selected_policy = settings.get("PolicySelector", policy_options[0])
+                await handle_policy_widget_selection(selected_policy)
+                
+                docs_list = "\n".join([
+                    f"• **{doc['doc_name']}** ({doc.get('faq_count', 0)} FAQs) - Status: {doc.get('doc_status', 'unknown')} - Updated: {safe_strftime(doc.get('updated_at'), default='Never')}"
+                    for doc in available_docs
+                ])
+                
+                welcome_message = f"""👋 **Welcome to the Policy Assistant!**
 
 🎯 **Current Selection:** {selected_policy}
 
@@ -651,8 +710,8 @@ You can:
 
 *Note: Use the dropdown selector above to change your policy focus, or use text commands for advanced features.*
 """
-        else:
-            welcome_message = """👋 **Welcome to the Policy Assistant!**
+            else:
+                welcome_message = """👋 **Welcome to the Policy Assistant!**
 
 ❌ **No policies are currently available.**
 
@@ -670,25 +729,21 @@ Please contact your administrator to upload policies, or check back later.
 
 @cl.on_settings_update
 async def setup_agent(settings):
-    """Handle settings updates, particularly policy selection."""
-    selected_policy = settings.get("PolicySelector", "All Policies (Search across all)")
-    await handle_policy_widget_selection(selected_policy)
+    if cl.context.session.client_type != "copilot":
+        selected_policy = settings.get("PolicySelector", "All Policies (Search across all)")
+        await handle_policy_widget_selection(selected_policy)
 
 async def handle_policy_widget_selection(selected_policy: str):
-    """Handle policy selection from the widget."""
     session_id = cl.user_session.get("session_id")
     available_docs = cl.user_session.get("available_docs", [])
     
     if selected_policy == "All Policies (Search across all)":
-        # Reset to search all policies
         cl.user_session.set("doc_id", None)
         cl.user_session.set("doc_name", None)
         response_message = "🌐 **Policy Selection:** All Policies\n\nI'll now search across all available policies to answer your questions."
     else:
-        # Extract policy name from the selection (remove the FAQ count part)
         policy_display_name = selected_policy.split(" (")[0]
         
-        # Find the matching document
         matching_doc = None
         for doc in available_docs:
             if doc['doc_name'] == policy_display_name:
@@ -717,356 +772,322 @@ async def main(message: cl.Message):
     user_message = message.content.strip()
     session_id = cl.user_session.get("session_id")
     doc_id = cl.user_session.get("doc_id")
+    is_copilot = cl.context.session.client_type == "copilot"
    
     if not session_id:
         await cl.Message(content="Session error. Please refresh the page.").send()
         return
-   
-    await db_manager.store_message(session_id, 'user', user_message)
-   
-    # Handle download commands (enhanced to support multiple formats)
-    if user_message.lower().startswith(('download ', 'get ', 'fetch ')):
-        await handle_policy_download(user_message)
-        return
-   
-    if user_message.lower().startswith('policy name'):
-        await handle_policy_name_query(user_message)
-        return
-   
-    if user_message.lower().startswith('policy id'):
-        await handle_policy_id_query(user_message)
-        return
-   
-    if user_message.lower().startswith('select policy'):
-        await handle_policy_selection(user_message)
-        return
-   
-    if user_message.lower() in ['list policies', 'show policies', 'available policies']:
-        await handle_policy_listing()
-        return
-   
-    if user_message.lower() in ['reset', 'clear selection', 'show all policies']:
-        cl.user_session.set("doc_id", None)
-        cl.user_session.set("doc_name", None)
-        response_message = "✅ Policy selection cleared. I'll now search across all available policies. You can also use the dropdown selector above to change your selection."
-        await cl.Message(content=response_message).send()
-        await db_manager.store_message(session_id, 'assistant', response_message)
-        return
-   
-    try:
-        conversation_history = await db_manager.get_conversation_history(session_id, limit=12)
-    except Exception as e:
-        conversation_history = []
-   
-    try:
-        response = await chatbot.generate_response(
-            user_message,
-            conversation_history,
-            doc_id
-        )
-       
-        if doc_id:
-            doc_name = cl.user_session.get("doc_name")
-            response = f"📄 *Searching in: {doc_name}*\n\n{response}"
-        else:
-            response = f"🌐 *Searching across: All Policies*\n\n{response}"
-       
-        success = await db_manager.store_message(session_id, 'assistant', response)
+    
+    # Handle system messages for Copilot
+    if is_copilot and message.type == "system_message":
+        response = f"Received system message: {user_message}"
         await cl.Message(content=response).send()
-       
+        await db_manager.store_message(session_id, 'assistant', response, message_type='system_response')
+        return
+    
+    # Store user message
+    await db_manager.store_message(session_id, 'user', user_message, message_type=message.type)
+    
+    # Handle special commands
+    if user_message.lower().startswith("list policies"):
+        await handle_list_policies(session_id, is_copilot)
+        return
+    
+    if user_message.lower().startswith("download "):
+        policy_name = user_message[9:].strip()
+        await download_policy_file(policy_name, session_id, is_copilot)
+        return
+    
+    if user_message.lower().startswith("policy name "):
+        policy_id_str = user_message[12:].strip()
+        await handle_policy_name_lookup(policy_id_str, session_id, is_copilot)
+        return
+    
+    if user_message.lower().startswith("policy id "):
+        policy_name = user_message[10:].strip()
+        await handle_policy_id_lookup(policy_name, session_id, is_copilot)
+        return
+    
+    # Handle Copilot test function manually
+    if is_copilot and user_message.lower().startswith("test "):
+        msg = user_message[5:].strip()
+        response = f"You sent: {msg}"
+        await cl.Message(content=response).send()
+        await db_manager.store_message(session_id, 'assistant', response)
+        return
+    
+    # Check if user is asking about a specific policy (copilot mode)
+    if is_copilot:
+        policy_match = await check_policy_mention(user_message)
+        if policy_match:
+            await suggest_policy_actions(policy_match, user_message)
+            return
+    
+    try:
+        conversation_history = await db_manager.get_conversation_history(session_id, limit=10)
+        
+        response = await chatbot.generate_response(
+            user_message, 
+            conversation_history, 
+            doc_id=doc_id,
+            is_copilot=is_copilot
+        )
+        
+        await cl.Message(content=response).send()
+        
+        await db_manager.store_message(session_id, 'assistant', response)
+        
     except Exception as e:
-        error_response = f"I'm sorry, I encountered an error while processing your question. Please try again."
+        print(f"Error in main message handler: {str(e)}")
+        error_response = "I'm sorry, I encountered an error while processing your question. Please try again."
         await cl.Message(content=error_response).send()
         await db_manager.store_message(session_id, 'assistant', error_response)
 
-async def handle_policy_selection(user_message):
-    session_id = cl.user_session.get("session_id")
-    parts = user_message.lower().split('select policy', 1)
-    
-    if len(parts) < 2:
-        response_message = "Please specify a policy name. Example: `select policy filename.pdf`\n\n💡 **Tip:** You can also use the dropdown selector above for easier policy selection."
-        await cl.Message(content=response_message).send()
-        await db_manager.store_message(session_id, 'assistant', response_message)
-        return
-   
-    doc_name_query = parts[1].strip()
-    available_docs = await chatbot.get_available_documents()
-    matching_doc = None
-   
-    for doc in available_docs:
-        if doc_name_query.lower() in doc['doc_name'].lower():
-            matching_doc = doc
-            break
-   
-    if matching_doc:
-        cl.user_session.set("doc_id", matching_doc['id'])
-        cl.user_session.set("doc_name", matching_doc['doc_name'])
-        response_message = (
-            f"✅ **Policy selected:** {matching_doc['doc_name']}\n\n"
-            f"📊 **Available FAQs:** {matching_doc.get('faq_count', 0)}\n\n"
-            f"📅 **Status:** {matching_doc.get('doc_status', 'unknown')}\n\n"
-            f"📅 **Last Updated:** {safe_strftime(matching_doc.get('updated_at'), default='Never')}\n\n"
-            f"I'll now focus my responses on this policy. Use `download {matching_doc['doc_name']}` to download.\n\n"
-            f"💡 **Tip:** The dropdown selector above has also been updated to reflect your selection."
-        )
-        await cl.Message(content=response_message).send()
-        await db_manager.store_message(session_id, 'assistant', response_message)
-    else:
-        docs_list = "\n".join([
-            f"• **{doc['doc_name']}** ({doc.get('faq_count', 0)} FAQs)"
-            for doc in available_docs
-        ])
-        response_message = (
-            f"❌ **Policy not found:** '{doc_name_query}'\n\n"
-            f"📚 **Available policies:**\n{docs_list}\n\n"
-            f"💡 **Tip:** Try using the dropdown selector above for easier selection."
-        )
-        await cl.Message(content=response_message).send()
-        await db_manager.store_message(session_id, 'assistant', response_message)
-
-async def handle_policy_download(user_message):
-    """Handle download commands with one-click PDF download functionality."""
-    session_id = cl.user_session.get("session_id")
-    
-    # Extract policy name from command
-    parts = user_message.lower().split(None, 1)
-    if len(parts) < 2:
-        current_doc_name = cl.user_session.get("doc_name")
-        if current_doc_name:
-            await download_policy_file(current_doc_name, session_id)
-        else:
-            response_message = (
-                "Please specify a policy name to download. Examples:\n"
-                "• `download policy_name.pdf`\n"
-                "• `get employee_handbook`\n"
-                "• `fetch privacy_policy`\n\n"
-                "💡 **Tip:** If you have a policy selected, just type `download` without a name."
-            )
-            await cl.Message(content=response_message).send()
-            await db_manager.store_message(session_id, 'assistant', response_message)
-        return
-    
-    doc_name_query = parts[1].strip()
-    await download_policy_file(doc_name_query, session_id)
-
-async def download_policy_file(doc_name_query, session_id):
-    """Download a policy file and send it to the user."""
+async def handle_list_policies(session_id: str, is_copilot: bool = False):
     try:
-        # Get policy details
-        policy_details = await db_manager.get_policy_details_by_name(doc_name_query)
+        available_docs = await chatbot.get_available_documents()
+        
+        if not available_docs:
+            response = "❌ **No policies available.**"
+        else:
+            if is_copilot:
+                response = f"📚 **Available Policies ({len(available_docs)}):**\n\n"
+                for doc in available_docs:
+                    response += f"• **{doc['doc_name']}** (ID: {doc['id']}, FAQs: {doc.get('faq_count', 0)})\n"
+                
+                response += "\n**Quick Actions:**\n"
+                response += "• Type policy name to get details\n"
+                response += "• Use `download [policy_name]` to download\n"
+                
+            else:
+                response = f"📚 **Available Policies ({len(available_docs)}):**\n\n"
+                for doc in available_docs:
+                    response += f"• **{doc['doc_name']}** (ID: {doc['id']})\n"
+                    response += f"  - FAQs: {doc.get('faq_count', 0)}\n"
+                    response += f"  - Status: {doc.get('doc_status', 'unknown')}\n"
+                    response += f"  - Updated: {safe_strftime(doc.get('updated_at'), default='Never')}\n"
+                    response += f"  - Size: {doc.get('file_size', 0)} bytes\n\n"
+                
+                response += "**Commands:**\n"
+                response += "• `policy name [id]` - Get policy name by ID\n"
+                response += "• `policy id [name]` - Get policy ID by name\n"
+                response += "• `download [policy_name]` - Download policy file\n"
+        
+        await cl.Message(content=response).send()
+        await db_manager.store_message(session_id, 'assistant', response)
+        
+    except Exception as e:
+        print(f"Error listing policies: {str(e)}")
+        error_response = "❌ Error retrieving policy list. Please try again."
+        await cl.Message(content=error_response).send()
+        await db_manager.store_message(session_id, 'assistant', error_response)
+
+async def download_policy_file(policy_name: str, session_id: str, is_copilot: bool = False):
+    try:
+        policy_details = await db_manager.get_policy_details_by_name(policy_name)
         
         if not policy_details:
-            available_docs = await chatbot.get_available_documents()
-            docs_list = "\n".join([
-                f"• **{doc['doc_name']}**"
-                for doc in available_docs
-            ])
-            response_message = (
-                f"❌ **Policy not found:** '{doc_name_query}'\n\n"
-                f"📚 **Available policies:**\n{docs_list}"
-            )
-            await cl.Message(content=response_message).send()
-            await db_manager.store_message(session_id, 'assistant', response_message)
+            response = f"❌ **Policy not found:** '{policy_name}'"
+            await cl.Message(content=response).send()
+            await db_manager.store_message(session_id, 'assistant', response)
             return
         
-        doc_path = policy_details['doc_path']
-        doc_name = policy_details['doc_name']
+        policy_path = policy_details['doc_path']
+        policy_full_name = policy_details['doc_name']
         
-        # Check if file exists
-        if not os.path.exists(doc_path):
-            response_message = f"❌ **File not found:** The policy file '{doc_name}' is not available on the server."
-            await cl.Message(content=response_message).send()
-            await db_manager.store_message(session_id, 'assistant', response_message)
+        if not os.path.exists(policy_path):
+            response = f"❌ **File not found:** {policy_full_name}\nPath: {policy_path}"
+            await cl.Message(content=response).send()
+            await db_manager.store_message(session_id, 'assistant', response)
             return
         
-        # Get file size
-        file_size = os.path.getsize(doc_path)
-        file_size_mb = file_size / (1024 * 1024)
-        
-        # Send download confirmation message first
-        download_msg = (
-            f"📥 **Preparing download:** {doc_name}\n\n"
-            f"📊 **File size:** {file_size_mb:.2f} MB\n"
-            f"⏳ **Status:** Processing..."
-        )
-        status_message = await cl.Message(content=download_msg).send()
-        
-        # Create the file element for download
         try:
-            # Read file content
-            with open(doc_path, 'rb') as f:
-                file_content = f.read()
-            
-            # Create file element
             file_element = cl.File(
-                name=doc_name,
-                content=file_content,
-                display="inline"  # This enables inline display/download
+                name=os.path.basename(policy_path),
+                path=policy_path,
+                display="inline"
             )
             
-            # Update status message
-            success_msg = (
-                f"✅ **Download ready:** {doc_name}\n\n"
-                f"📊 **File size:** {file_size_mb:.2f} MB\n"
-                f"📁 **Status:** Ready for download\n\n"
-                f"Click the file below to download:"
-            )
+            if is_copilot:
+                response = f"📄 **{policy_full_name}** - Download ready"
+            else:
+                response = f"📄 **Download Ready:** {policy_full_name}\n\n📁 **File:** {os.path.basename(policy_path)}"
             
-            # Send the file with success message
             await cl.Message(
-                content=success_msg,
+                content=response,
                 elements=[file_element]
             ).send()
             
-            await db_manager.store_message(session_id, 'assistant', f"Downloaded: {doc_name}")
+            await db_manager.store_message(session_id, 'assistant', f"Downloaded policy: {policy_full_name}")
             
         except Exception as file_error:
-            error_msg = f"❌ **Download failed:** Could not prepare file for download. Error: {str(file_error)}"
-            await cl.Message(content=error_msg).send()
-            await db_manager.store_message(session_id, 'assistant', error_msg)
+            print(f"File creation error: {str(file_error)}")
+            response = f"❌ **Download Error:** Could not prepare file for download.\nPolicy: {policy_full_name}"
+            await cl.Message(content=response).send()
+            await db_manager.store_message(session_id, 'assistant', response)
             
     except Exception as e:
-        error_response = f"❌ **Error:** Could not process download request. Please try again or contact support."
+        print(f"Error in download_policy_file: {str(e)}")
+        error_response = f"❌ **Error downloading policy:** {policy_name}"
         await cl.Message(content=error_response).send()
         await db_manager.store_message(session_id, 'assistant', error_response)
 
-async def handle_policy_name_query(user_message):
-    """Handle 'policy name [id]' queries."""
-    session_id = cl.user_session.get("session_id")
-    parts = user_message.split()
-    
-    if len(parts) < 3 or not parts[2].isdigit():
-        response_message = "Please provide a valid policy ID. Example: `policy name 123`"
-        await cl.Message(content=response_message).send()
-        await db_manager.store_message(session_id, 'assistant', response_message)
-        return
-    
-    doc_id = int(parts[2])
-    policy_name = await db_manager.get_policy_name_by_id(doc_id)
-    
-    if policy_name:
-        response_message = f"📄 **Policy ID {doc_id}:** {policy_name}"
+async def handle_policy_name_lookup(policy_id_str: str, session_id: str, is_copilot: bool = False):
+    try:
+        policy_id = int(policy_id_str)
+        policy_name = await db_manager.get_policy_name_by_id(policy_id)
         
-        # Add download button
-        download_button_msg = f"\n\n💾 **Quick actions:**\n• Type `download {policy_name}` to download\n• Type `select policy {policy_name}` to focus on this policy"
-        response_message += download_button_msg
-    else:
-        response_message = f"❌ **Policy not found:** No policy exists with ID {doc_id}"
-    
-    await cl.Message(content=response_message).send()
-    await db_manager.store_message(session_id, 'assistant', response_message)
+        if policy_name:
+            if is_copilot:
+                response = f"📄 **ID {policy_id}:** {policy_name}"
+            else:
+                response = f"📄 **Policy Name for ID {policy_id}:**\n\n**{policy_name}**"
+        else:
+            response = f"❌ **No policy found with ID:** {policy_id}"
+        
+        await cl.Message(content=response).send()
+        await db_manager.store_message(session_id, 'assistant', response)
+        
+    except ValueError:
+        response = f"❌ **Invalid ID format:** '{policy_id_str}' (must be a number)"
+        await cl.Message(content=response).send()
+        await db_manager.store_message(session_id, 'assistant', response)
+    except Exception as e:
+        print(f"Error in policy name lookup: {str(e)}")
+        error_response = "❌ **Error looking up policy name.**"
+        await cl.Message(content=error_response).send()
+        await db_manager.store_message(session_id, 'assistant', error_response)
 
-async def handle_policy_id_query(user_message):
-    """Handle 'policy id [name]' queries."""
-    session_id = cl.user_session.get("session_id")
-    parts = user_message.split('policy id', 1)
-    
-    if len(parts) < 2:
-        response_message = "Please provide a policy name. Example: `policy id employee_handbook.pdf`"
-        await cl.Message(content=response_message).send()
-        await db_manager.store_message(session_id, 'assistant', response_message)
-        return
-    
-    doc_name = parts[1].strip()
-    policy_id = await db_manager.get_policy_id_by_name(doc_name)
-    
-    if policy_id:
-        response_message = f"🆔 **Policy '{doc_name}'** has ID: {policy_id}"
+async def handle_policy_id_lookup(policy_name: str, session_id: str, is_copilot: bool = False):
+    try:
+        policy_id = await db_manager.get_policy_id_by_name(policy_name)
         
-        # Add quick actions
-        quick_actions = f"\n\n💾 **Quick actions:**\n• Type `download {doc_name}` to download\n• Type `select policy {doc_name}` to focus on this policy"
-        response_message += quick_actions
-    else:
+        if policy_id:
+            if is_copilot:
+                response = f"🔢 **'{policy_name}':** ID {policy_id}"
+            else:
+                response = f"🔢 **Policy ID for '{policy_name}':**\n\n**ID: {policy_id}**"
+        else:
+            response = f"❌ **No policy found matching:** '{policy_name}'"
+        
+        await cl.Message(content=response).send()
+        await db_manager.store_message(session_id, 'assistant', response)
+        
+    except Exception as e:
+        print(f"Error in policy ID lookup: {str(e)}")
+        error_response = "❌ **Error looking up policy ID.**"
+        await cl.Message(content=error_response).send()
+        await db_manager.store_message(session_id, 'assistant', error_response)
+
+async def check_policy_mention(user_message: str) -> Optional[Dict]:
+    try:
         available_docs = await chatbot.get_available_documents()
-        docs_list = "\n".join([f"• **{doc['doc_name']}**" for doc in available_docs])
-        response_message = (
-            f"❌ **Policy not found:** '{doc_name}'\n\n"
-            f"📚 **Available policies:**\n{docs_list}"
-        )
-    
-    await cl.Message(content=response_message).send()
-    await db_manager.store_message(session_id, 'assistant', response_message)
-
-async def handle_policy_listing():
-    """Handle policy listing requests."""
-    session_id = cl.user_session.get("session_id")
-    available_docs = await chatbot.get_available_documents()
-    
-    if available_docs:
-        docs_info = []
+        user_lower = user_message.lower()
+        
         for doc in available_docs:
-            doc_info = (
-                f"📄 **{doc['doc_name']}**\n"
-                f"   • ID: {doc['id']}\n"
-                f"   • FAQs: {doc.get('faq_count', 0)}\n"
-                f"   • Status: {doc.get('doc_status', 'unknown')}\n"
-                f"   • Updated: {safe_strftime(doc.get('updated_at'), default='Never')}\n"
-                f"   • Download: `download {doc['doc_name']}`"
-            )
-            docs_info.append(doc_info)
+            doc_name_lower = doc['doc_name'].lower()
+            if doc_name_lower in user_lower or any(word in user_lower for word in doc_name_lower.split() if len(word) > 3):
+                return {
+                    'id': doc['id'],
+                    'name': doc['doc_name'],
+                    'path': doc['doc_path'],
+                    'faq_count': doc.get('faq_count', 0)
+                }
+        return None
+    except Exception as e:
+        print(f"Error checking policy mention: {str(e)}")
+        return None
+
+async def suggest_policy_actions(policy_match: Dict, user_message: str):
+    try:
+        policy_name = policy_match['name']
+        policy_id = policy_match['id']
+        faq_count = policy_match.get('faq_count', 0)
         
-        response_message = (
-            f"📚 **Available Policies ({len(available_docs)} total):**\n\n" +
-            "\n\n".join(docs_info) +
-            "\n\n💡 **Tips:**\n"
-            "• Use `download [policy_name]` to download any policy\n"
-            "• Use `select policy [policy_name]` to focus on a specific policy\n"
-            "• Use the dropdown selector above for easier navigation"
+        actions = [
+            cl.Action(
+                name="select_policy",
+                value=policy_name,
+                label=f"📄 Select {policy_name}",
+                description=f"Focus on {policy_name} ({faq_count} FAQs)"
+            ),
+            cl.Action(
+                name="download_policy",
+                value=policy_name,
+                label=f"⬇️ Download {policy_name}",
+                description=f"Download policy document"
+            )
+        ]
+        
+        response = f"🎯 **Detected Policy:** {policy_name}\n\n📊 **FAQs Available:** {faq_count}\n\n**Quick Actions:**"
+        
+        await cl.Message(
+            content=response,
+            actions=actions
+        ).send()
+        
+        session_id = cl.user_session.get("session_id")
+        conversation_history = await db_manager.get_conversation_history(session_id, limit=5)
+        
+        policy_response = await chatbot.generate_response(
+            user_message, 
+            conversation_history, 
+            doc_id=policy_id,
+            is_copilot=True
         )
-    else:
-        response_message = "❌ **No policies available.** Please contact your administrator to upload policies."
-    
-    await cl.Message(content=response_message).send()
-    await db_manager.store_message(session_id, 'assistant', response_message)
+        
+        await cl.Message(content=f"**About {policy_name}:**\n\n{policy_response}").send()
+        
+        if session_id:
+            await db_manager.store_message(session_id, 'assistant', response)
+            await db_manager.store_message(session_id, 'assistant', f"About {policy_name}: {policy_response}")
+        
+    except Exception as e:
+        print(f"Error suggesting policy actions: {str(e)}")
+        session_id = cl.user_session.get("session_id")
+        conversation_history = await db_manager.get_conversation_history(session_id, limit=5)
+        response = await chatbot.generate_response(user_message, conversation_history, is_copilot=True)
+        await cl.Message(content=response).send()
 
-# Enhanced welcome message function with download capabilities
-async def send_enhanced_welcome_message(available_docs, selected_policy):
-    """Send an enhanced welcome message with download options."""
-    if available_docs:
-        docs_list = []
-        for doc in available_docs:
-            doc_entry = (
-                f"• **{doc['doc_name']}** ({doc.get('faq_count', 0)} FAQs)\n"
-                f"  📥 Quick download: `download {doc['doc_name']}`"
+async def handle_policy_selection_by_name(policy_name: str, is_copilot: bool = False):
+    try:
+        policy_details = await db_manager.get_policy_details_by_name(policy_name)
+        
+        if not policy_details:
+            response = f"❌ **Policy not found:** '{policy_name}'"
+            await cl.Message(content=response).send()
+            return
+        
+        cl.user_session.set("doc_id", policy_details['id'])
+        cl.user_session.set("doc_name", policy_details['doc_name'])
+        
+        if is_copilot:
+            response = f"✅ **Selected:** {policy_details['doc_name']}\n\n🎯 **Ready to answer questions about this policy**"
+        else:
+            response = (
+                f"✅ **Policy Selected:** {policy_details['doc_name']}\n\n"
+                f"🆔 **ID:** {policy_details['id']}\n"
+                f"📁 **Path:** {policy_details['doc_path']}\n\n"
+                f"I'll now focus my responses on this specific policy."
             )
-            docs_list.append(doc_entry)
         
-        docs_display = "\n".join(docs_list)
+        await cl.Message(content=response).send()
         
-        welcome_message = f"""👋 **Welcome to the Enhanced Policy Assistant!**
+        session_id = cl.user_session.get("session_id")
+        if session_id:
+            await db_manager.store_message(session_id, 'assistant', response)
+        
+    except Exception as e:
+        print(f"Error in handle_policy_selection_by_name: {str(e)}")
+        error_response = f"❌ **Error selecting policy:** {policy_name}"
+        await cl.Message(content=error_response).send()
 
-🎯 **Current Selection:** {selected_policy}
+async def cleanup():
+    global connection_pool
+    if connection_pool:
+        await connection_pool.close()
 
-📚 **Available Policies:**
-{docs_display}
-
-🔧 **Available Commands:**
-• **Policy Selection:**
-  - Use the dropdown selector above
-  - `select policy [name]` - Focus on specific policy
-  - `reset` - Clear selection (search all policies)
-
-• **Information Commands:**
-  - `list policies` - Show all available policies
-  - `policy name [id]` - Get policy name by ID
-  - `policy id [name]` - Get policy ID by name
-
-• **Download Commands:**
-  - `download [policy_name]` - Download specific policy
-  - `download` - Download currently selected policy
-  - `get [policy_name]` - Alternative download command
-  - `fetch [policy_name]` - Another download option
-
-💬 **Ask me anything about the policies, and I'll provide detailed answers!**
-
-*Note: All downloads are one-click and work directly in your browser.*"""
-    else:
-        welcome_message = """👋 **Welcome to the Policy Assistant!**
-
-❌ **No policies are currently available.**
-
-Please contact your administrator to upload policies, or check back later.
-
-💬 **Feel free to ask me questions and I'll do my best to help!**"""
-    
-    return welcome_message
+if __name__ == "__main__":
+    import atexit
+    atexit.register(lambda: asyncio.run(cleanup()))
+    cl.run()

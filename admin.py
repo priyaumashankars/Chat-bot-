@@ -19,7 +19,7 @@ load_dotenv()
 DATABASE_URL = os.getenv('DATABASE_URL')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads')
-
+os.environ["CHAINLIT_ALLOW_ORIGINS"] = '["*"]'
 # Disable Chainlit's data layer to avoid conflicts
 cl.data_layer = None
 
@@ -740,7 +740,6 @@ async def show_processing_stats():
 
 📈 **Success Rate:** {success_rate:.1f}%
 """
-
             await cl.Message(content=stats_msg).send()
 
         except Exception as e:
