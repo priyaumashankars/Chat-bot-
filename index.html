@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Policy Assistant with Copilot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            padding: 2rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        
+        .copilot-button {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 50px;
+            padding: 15px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            z-index: 1000;
+            transition: all 0.3s ease;
+        }
+        
+        .copilot-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+        }
+        
+        .copilot-iframe {
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            width: 400px;
+            height: 600px;
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            display: none;
+            z-index: 999;
+        }
+        
+        @media (max-width: 768px) {
+            .copilot-iframe {
+                width: calc(100vw - 40px);
+                height: 70vh;
+                bottom: 80px;
+                right: 20px;
+                left: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏢 Policy Management System</h1>
+            <p>Welcome to your AI-powered policy assistant</p>
+        </div>
+        
+        <div class="content">
+            <h2>📚 Available Features</h2>
+            <ul>
+                <li>🔍 Search through company policies</li>
+                <li>💬 Ask questions about policies </li>
+                <li>📄 Download policy documents</li>
+                <li>🤖 Get instant answers</li>
+            </ul>
+            
+            <h2>🚀 Getting Started</h2>
+            <p>Click the AI Assistant button in the bottom-right corner to start chatting with your policy copilot!</p>
+        </div>
+    </div>
+    
+    <!-- Copilot Button -->
+    <button class="copilot-button" onclick="toggleCopilot()">
+        🤖 AI Assistant
+    </button>
+    
+    <!-- Copilot Iframe -->
+    <iframe 
+        id="copilot-frame"
+        class="copilot-iframe"
+        src="http://localhost:8000/copilot"
+        title="Policy Assistant Copilot">
+    </iframe>
+    
+    <script>
+        let copilotOpen = false;
+        
+        function toggleCopilot() {
+            const iframe = document.getElementById('copilot-frame');
+            const button = document.querySelector('.copilot-button');
+            
+            if (copilotOpen) {
+                iframe.style.display = 'none';
+                button.textContent = '🤖 AI Assistant';
+                copilotOpen = false;
+            } else {
+                iframe.style.display = 'block';
+                button.textContent = '✕ Close';
+                copilotOpen = true;
+            }
+        }
+        
+        // Handle escape key to close copilot
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape' && copilotOpen) {
+                toggleCopilot();
+            }
+        });
+        
+        // Auto-load copilot after 3 seconds (optional)
+        setTimeout(() => {
+            if (!copilotOpen) {
+                const button = document.querySelector('.copilot-button');
+                button.textContent = '🤖 AI Assistant (Click me!)';
+                button.style.animation = 'pulse 2s infinite';
+            }
+        }, 3000);
+        
+        // Add pulse animation
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes pulse {
+                0% { box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+                50% { box-shadow: 0 6px 25px rgba(102, 126, 234, 0.5); }
+                100% { box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+            }
+        `;
+        document.head.appendChild(style);
+    </script>
+</body>
+</html>

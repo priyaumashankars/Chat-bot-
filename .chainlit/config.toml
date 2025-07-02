@@ -123,5 +123,25 @@ cot = "full"
 [meta]
 generated_by = "2.5.5"
 
+[project]
+name = "Policy Assistant Copilot"
+description = "AI-powered policy management"
+
+[copilot]
+enabled = true
+title = "Policy Assistant"
+description = "Ask me anything about company policies"
+avatar = "🤖"
+theme = "light"
+
+[copilot.features]
+enable_feedback = true
+enable_download = true
+enable_search = true
+
+[copilot.ui]
+primary_color = "#667eea"
+background_color = "#ffffff"
+border_radius = "15px"
 
 
