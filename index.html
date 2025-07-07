@@ -48,6 +48,12 @@
             box-shadow: 0 6px 20px rgba(0,0,0,0.4);
         }
         
+        .copilot-button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
         .copilot-iframe {
             position: fixed;
             bottom: 80px;
@@ -61,6 +67,95 @@
             z-index: 999;
         }
         
+        .auth-section {
+            background: #f8f9fa;
+            padding: 2rem;
+            border-radius: 15px;
+            margin-bottom: 2rem;
+            border: 2px solid #e9ecef;
+        }
+        
+        .auth-form {
+            max-width: 500px;
+            margin: 0 auto;
+        }
+        
+        .form-group {
+            margin-bottom: 1rem;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 0.75rem;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        
+        .form-group input:focus, .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .auth-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .auth-btn:hover {
+            background: #5a6fd8;
+        }
+        
+        .auth-btn.secondary {
+            background: #6c757d;
+        }
+        
+        .auth-message {
+            padding: 1rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+            font-weight: 500;
+        }
+        
+        .auth-message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .auth-message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .user-info {
+            background: #d4edda;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 2rem;
+            border-left: 4px solid #28a745;
+        }
+        
+        .hidden {
+            display: none;
+        }
+        
         @media (max-width: 768px) {
             .copilot-iframe {
                 width: calc(100vw - 40px);
@@ -71,6 +166,12 @@
             }
         }
     </style>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.20.15/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios@1.4.0/dist/axios.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@chainlit/react-client@2.0.0/dist/index.js"></script>
 </head>
 <body>
     <div class="container">
@@ -79,77 +180,287 @@
             <p>Welcome to your AI-powered policy assistant</p>
         </div>
         
-        <div class="content">
-            <h2>📚 Available Features</h2>
-            <ul>
-                <li>🔍 Search through company policies</li>
-                <li>💬 Ask questions about policies </li>
-                <li>📄 Download policy documents</li>
-                <li>🤖 Get instant answers</li>
-            </ul>
-            
-            <h2>🚀 Getting Started</h2>
-            <p>Click the AI Assistant button in the bottom-right corner to start chatting with your policy copilot!</p>
-        </div>
+        <!-- React Root -->
+        <div id="root"></div>
+        <div id="error" class="text-red-500 text-center p-4"></div>
     </div>
     
     <!-- Copilot Button -->
-    <button class="copilot-button" onclick="toggleCopilot()">
-        🤖 AI Assistant
+    <button class="copilot-button" id="copilotBtn" disabled>
+        🤖 AI Assistant (Login Required)
     </button>
     
     <!-- Copilot Iframe -->
     <iframe 
         id="copilot-frame"
         class="copilot-iframe"
-        src="http://localhost:8000/copilot"
         title="Policy Assistant Copilot">
     </iframe>
     
-    <script>
-        let copilotOpen = false;
-        
-        function toggleCopilot() {
-            const iframe = document.getElementById('copilot-frame');
-            const button = document.querySelector('.copilot-button');
-            
-            if (copilotOpen) {
-                iframe.style.display = 'none';
-                button.textContent = '🤖 AI Assistant';
-                copilotOpen = false;
-            } else {
-                iframe.style.display = 'block';
-                button.textContent = '✕ Close';
-                copilotOpen = true;
-            }
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        const { useChatSession, ChainlitProvider, useChatMessages, sendMessage } = ChainlitReactClient;
+
+        const LoginPage = ({ onLoginSuccess }) => {
+            const [userId, setUserId] = useState('');
+            const [userName, setUserName] = useState('');
+            const [userEmail, setUserEmail] = useState('');
+            const [userRole, setUserRole] = useState('user');
+            const [error, setError] = useState('');
+            const [loading, setLoading] = useState(false);
+
+            const handleLogin = async () => {
+                if (!userId.trim() || !userName.trim()) {
+                    setError('Please fill in all required fields.');
+                    return;
+                }
+                setLoading(true);
+                setError('');
+                try {
+                    console.log('Attempting login with:', { userId, userName, userEmail, userRole });
+                    const response = await axios.post('http://localhost:8000/login', {
+                        identifier: userId,
+                        password: 'password', // Replace with secure password handling
+                        metadata: { name: userName, email: userEmail, role: userRole }
+                    }, { withCredentials: true });
+                    if (response.data.message === 'Login successful') {
+                        onLoginSuccess(response.data.identifier);
+                    }
+                } catch (err) {
+                    console.error('Login error:', err);
+                    setError(err.response?.data?.detail || 'Login failed. Please check your credentials and try again.');
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const fillExampleData = () => {
+                setUserId('user-1');
+                setUserName('John Doe');
+                setUserEmail('john.doe@company.com');
+                setUserRole('admin');
+            };
+
+            return (
+                <div className="auth-section">
+                    <h2>🔐 Authentication Required</h2>
+                    <p>Please login to access your AI policy assistant</p>
+                    <div className="auth-form">
+                        <div className="form-group">
+                            <label htmlFor="userId">User ID:</label>
+                            <input
+                                type="text"
+                                id="userId"
+                                value={userId}
+                                onChange={(e) => setUserId(e.target.value)}
+                                placeholder="Enter your user ID"
+                            />
+                        </div>
+                        <div className="form-group">
+                            <label htmlFor="userName">Full Name:</label>
+                            <input
+                                type="text"
+                                id="userName"
+                                value={userName}
+                                onChange={(e) => setUserName(e.target.value)}
+                                placeholder="Enter your full name"
+                            />
+                        </div>
+                        <div className="form-group">
+                            <label htmlFor="userEmail">Email:</label>
+                            <input
+                                type="email"
+                                id="userEmail"
+                                value={userEmail}
+                                onChange={(e) => setUserEmail(e.target.value)}
+                                placeholder="Enter your email (optional)"
+                            />
+                        </div>
+                        <div className="form-group">
+                            <label htmlFor="userRole">Role:</label>
+                            <select
+                                id="userRole"
+                                value={userRole}
+                                onChange={(e) => setUserRole(e.target.value)}
+                            >
+                                <option value="user">User</option>
+                                <option value="admin">Admin</option>
+                                <option value="manager">Manager</option>
+                                <option value="analyst">Analyst</option>
+                            </select>
+                        </div>
+                        {error && <div className="auth-message error">{error}</div>}
+                        <button
+                            type="button"
+                            className="auth-btn secondary"
+                            onClick={fillExampleData}
+                        >
+                            📝 Fill Example
+                        </button>
+                        <button
+                            type="button"
+                            className="auth-btn"
+                            onClick={handleLogin}
+                            disabled={loading}
+                        >
+                            {loading ? 'Logging in...' : '🚀 Login & Start'}
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
+        const ChatPage = ({ userIdentifier, onLogout, toggleCopilot }) => {
+            const { connect, disconnect, isConnected, connectionError } = useChatSession();
+            const { messages } = useChatMessages();
+            const [inputValue, setInputValue] = useState('');
+            const [copilotOpen, setCopilotOpen] = useState(false);
+
+            useEffect(() => {
+                console.log('Connecting to WebSocket...');
+                connect({
+                    wsEndpoint: 'ws://localhost:8000/ws',
+                    userEnv: {},
+                    clientType: 'copilot'
+                }).catch(err => console.error('WebSocket connection error:', err));
+                return () => disconnect();
+            }, [connect, disconnect]);
+
+            const handleSendMessage = () => {
+                if (inputValue.trim()) {
+                    sendMessage({ content: inputValue });
+                    setInputValue('');
+                }
+            };
+
+            return (
+                <div>
+                    <div className="user-info">
+                        <strong>👤 Logged in as:</strong> <span>{userIdentifier}</span>
+                        <button
+                            className="auth-btn"
+                            style={{ background: '#dc3545', marginLeft: '1rem' }}
+                            onClick={onLogout}
+                        >
+                            🚪 Logout
+                        </button>
+                    </div>
+                    <div className="content">
+                        <h2>📚 Available Features</h2>
+                        <ul>
+                            <li>🔍 Search through company policies</li>
+                            <li>💬 Ask questions about policies</li>
+                            <li>📄 Download policy documents</li>
+                            <li>🤖 Get instant answers</li>
+                        </ul>
+                        <h2>🚀 Getting Started</h2>
+                        <p>Click the AI Assistant button to chat with your policy copilot!</p>
+                    </div>
+                    <div
+                        id="copilot-frame"
+                        className="copilot-iframe"
+                        style={{ display: copilotOpen ? 'block' : 'none' }}
+                    >
+                        <div className="h-full w-full">
+                            {messages.map((msg, index) => (
+                                <div key={index} className={`mb-2 ${msg.author === 'user' ? 'text-right' : 'text-left'}`}>
+                                    <span className={`inline-block p-2 rounded-lg ${msg.author === 'user' ? 'bg-blue-100' : 'bg-gray-100'}`}>
+                                        <strong>{msg.author === 'user' ? 'You' : 'Assistant'}:</strong> {msg.content}
+                                    </span>
+                                </div>
+                            ))}
+                            <div className="flex gap-2 p-2 border-t">
+                                <input
+                                    type="text"
+                                    value={inputValue}
+                                    onChange={(e) => setInputValue(e.target.value)}
+                                    onKeyPress={(e) => {
+                                        if (e.key === 'Enter') handleSendMessage();
+                                    }}
+                                    placeholder="Type your message..."
+                                    className="flex-grow px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                />
+                                <button
+                                    onClick={handleSendMessage}
+                                    className="py-2 px-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+                                >
+                                    Send
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [isAuthenticated, setIsAuthenticated] = useState(false);
+            const [userIdentifier, setUserIdentifier] = useState('');
+            const copilotBtn = document.getElementById('copilotBtn');
+
+            const handleLogout = async () => {
+                try {
+                    console.log('Attempting logout...');
+                    await axios.post('http://localhost:8000/logout', {}, { withCredentials: true });
+                    setIsAuthenticated(false);
+                    setUserIdentifier('');
+                    if (copilotBtn) copilotBtn.disabled = true;
+                    copilotBtn.textContent = '🤖 AI Assistant (Login Required)';
+                } catch (err) {
+                    console.error('Logout failed:', err);
+                }
+            };
+
+            useEffect(() => {
+                if (!document.getElementById('root')) {
+                    document.getElementById('error').textContent = 'Error: Root element not found. Check HTML structure.';
+                }
+                const savedUser = localStorage.getItem('policyAssistant_user');
+                if (savedUser) {
+                    const user = JSON.parse(savedUser);
+                    setIsAuthenticated(true);
+                    setUserIdentifier(user.identifier);
+                    if (copilotBtn) copilotBtn.disabled = false;
+                }
+            }, []);
+
+            const toggleCopilot = () => {
+                if (!isAuthenticated) {
+                    document.getElementById('error').textContent = 'Please login first to use the AI Assistant.';
+                    return;
+                }
+                const iframe = document.getElementById('copilot-frame');
+                if (iframe.style.display === 'block') {
+                    iframe.style.display = 'none';
+                    copilotBtn.textContent = '🤖 AI Assistant';
+                } else {
+                    iframe.style.display = 'block';
+                    copilotBtn.textContent = '✕ Close';
+                }
+            };
+
+            return (
+                <ChainlitProvider>
+                    {isAuthenticated ? (
+                        <ChatPage userIdentifier={userIdentifier} onLogout={handleLogout} toggleCopilot={toggleCopilot} />
+                    ) : (
+                        <LoginPage onLoginSuccess={(identifier) => {
+                            console.log('Login successful for:', identifier);
+                            setIsAuthenticated(true);
+                            setUserIdentifier(identifier);
+                            if (copilotBtn) copilotBtn.disabled = false;
+                        }} />
+                    )}
+                </ChainlitProvider>
+            );
+        };
+
+        try {
+            ReactDOM.render(<App />, document.getElementById('root'));
+        } catch (e) {
+            console.error('Render error:', e);
+            document.getElementById('error').textContent = 'Error rendering app. Check console for details.';
         }
-        
-        // Handle escape key to close copilot
-        document.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape' && copilotOpen) {
-                toggleCopilot();
-            }
-        });
-        
-        // Auto-load copilot after 3 seconds (optional)
-        setTimeout(() => {
-            if (!copilotOpen) {
-                const button = document.querySelector('.copilot-button');
-                button.textContent = '🤖 AI Assistant (Click me!)';
-                button.style.animation = 'pulse 2s infinite';
-            }
-        }, 3000);
-        
-        // Add pulse animation
-        const style = document.createElement('style');
-        style.textContent = `
-            @keyframes pulse {
-                0% { box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
-                50% { box-shadow: 0 6px 25px rgba(102, 126, 234, 0.5); }
-                100% { box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
-            }
-        `;
-        document.head.appendChild(style);
     </script>
 </body>
 </html>

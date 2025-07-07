@@ -1,6 +1,8 @@
 [project]
 # Whether to enable telemetry (default: true). No personal data is collected.
 enable_telemetry = true
+name = "Policy Assistant Copilot"
+description = "AI-powered policy management"
 
 [data]
 provider = "postgres"
@@ -123,10 +125,6 @@ cot = "full"
 [meta]
 generated_by = "2.5.5"
 
-[project]
-name = "Policy Assistant Copilot"
-description = "AI-powered policy management"
-
 [copilot]
 enabled = true
 title = "Policy Assistant"
@@ -143,5 +141,3 @@ enable_search = true
 primary_color = "#667eea"
 background_color = "#ffffff"
 border_radius = "15px"
-
-

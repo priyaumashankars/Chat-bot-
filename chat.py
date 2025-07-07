@@ -1,6 +1,6 @@
 import os
 import asyncpg
-import openai
+from openai import OpenAI
 import uuid
 from datetime import datetime, timedelta
 import numpy as np
@@ -11,8 +11,14 @@ import chainlit as cl
 from chainlit.input_widget import Select
 import asyncio
 from chainlit.data.chainlit_data_layer import ChainlitDataLayer
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 import jwt
+from fastapi import FastAPI, Response, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+
+# FastAPI app for login endpoint
+app = FastAPI()
 
 # Custom ChainlitDataLayer to fix parameter type mismatch
 class CustomChainlitDataLayer(ChainlitDataLayer):
@@ -103,100 +109,12 @@ class CustomChainlitDataLayer(ChainlitDataLayer):
             return await super().create_step(step_dict)
         except Exception as e:
             return None
-
-# JWT Authentication Functions
-def create_jwt_token(identifier: str, metadata: dict, secret: str) -> str:
-    """Create a JWT token for authentication"""
-    to_encode = {
-        "identifier": identifier,
-        "metadata": metadata,
-        "exp": datetime.utcnow() + timedelta(minutes=60 * 24 * 15),  # 15 days
-        "iat": datetime.utcnow(),
-        "iss": "chainlit-policy-assistant"
-    }
-    
-    encoded_jwt = jwt.encode(to_encode, secret, algorithm="HS256")
-    return encoded_jwt
-
-def verify_jwt_token(token: str, secret: str) -> Optional[Dict]:
-    """Verify and decode JWT token"""
-    try:
-        decoded = jwt.decode(token, secret, algorithms=["HS256"])
-        return decoded
-    except jwt.ExpiredSignatureError:
-        print("Token has expired")
-        return None
-    except jwt.InvalidTokenError as e:
-        print(f"Invalid token: {e}")
-        return None
-
-@cl.password_auth_callback
-def auth_callback(username: str, password: str) -> Optional[cl.User]:
-    """Handle password-based authentication (fallback)"""
-    # You can implement password-based auth here as a fallback
-    # For now, we'll just return None to force JWT authentication
-    return None
-
-@cl.oauth_callback
-def oauth_callback(
-    provider_id: str,
-    token: str,
-    raw_user_data: Dict[str, str],
-    default_user: cl.User,
-) -> Optional[cl.User]:
-    """Handle OAuth authentication with JWT token verification"""
-    
-    # Get the JWT secret from environment
-    jwt_secret = os.getenv('CHAINLIT_AUTH_SECRET')
-    if not jwt_secret:
-        print("CHAINLIT_AUTH_SECRET not found in environment variables")
-        return None
-    
-    # Verify the JWT token
-    decoded_token = verify_jwt_token(token, jwt_secret)
-    if not decoded_token:
-        print("Invalid or expired JWT token")
-        return None
-    
-    # Extract user information from the decoded token
-    user_id = decoded_token.get('identifier')
-    user_metadata = decoded_token.get('metadata', {})
-    
-    if not user_id:
-        print("No user identifier found in token")
-        return None
-    
-    # Create user object with information from JWT
-    user = cl.User(
-        identifier=user_id,
-        metadata={
-            **user_metadata,
-            "provider": provider_id,
-            "authenticated_at": datetime.utcnow().isoformat(),
-            "token_issued_at": decoded_token.get('iat'),
-            "token_expires_at": decoded_token.get('exp')
-        }
-    )
-    
-    return user
-
-@cl.header_auth_callback
 def header_auth_callback(headers: Dict) -> Optional[cl.User]:
-    """Handle header-based authentication with JWT"""
-    
-    # Get the JWT secret from environment
-    jwt_secret = os.getenv('CHAINLIT_AUTH_SECRET')
-    if not jwt_secret:
-        print("CHAINLIT_AUTH_SECRET not found in environment variables")
-        return None
-    
-    # Check for Authorization header
     auth_header = headers.get("authorization") or headers.get("Authorization")
     if not auth_header:
         print("No authorization header found")
         return None
     
-    # Extract token from "Bearer <token>" format
     try:
         scheme, token = auth_header.split(" ", 1)
         if scheme.lower() != "bearer":
@@ -206,57 +124,132 @@ def header_auth_callback(headers: Dict) -> Optional[cl.User]:
         print("Invalid authorization header format")
         return None
     
-    # Verify the JWT token
-    decoded_token = verify_jwt_token(token, jwt_secret)
-    if not decoded_token:
-        print("Invalid or expired JWT token")
-        return None
-    
-    # Extract user information from the decoded token
-    user_id = decoded_token.get('identifier')
-    user_metadata = decoded_token.get('metadata', {})
-    
-    if not user_id:
-        print("No user identifier found in token")
-        return None
-    
-    # Create user object with information from JWT
-    user = cl.User(
-        identifier=user_id,
-        metadata={
-            **user_metadata,
-            "authenticated_at": datetime.utcnow().isoformat(),
-            "token_issued_at": decoded_token.get('iat'),
-            "token_expires_at": decoded_token.get('exp')
-        }
-    )
-    
-    return user
-
+    return validate_jwt_token(token)
 # Load environment variables
 load_dotenv()
 DATABASE_URL = os.getenv('DATABASE_URL')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-CHAINLIT_AUTH_SECRET = os.getenv('CHAINLIT_AUTH_SECRET')
+JWT_SECRET = os.getenv('JWT_SECRET')
 
 # Validate environment variables
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is required")
-
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY is required")
-
-if not CHAINLIT_AUTH_SECRET:
-    raise ValueError("CHAINLIT_AUTH_SECRET is required for authentication")
+if not JWT_SECRET:
+    raise ValueError("JWT_SECRET is required for secure authentication")
 
 # Override default Chainlit data layer with DATABASE_URL
 cl.data_layer = CustomChainlitDataLayer(database_url=DATABASE_URL)
 
 # Initialize OpenAI client
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Global connection pool
 connection_pool = None
+
+# JWT settings
+ALGORITHM = "HS256"
+
+# Pydantic model for login request
+class LoginRequest(BaseModel):
+    identifier: str
+    password: str
+
+def create_jwt(identifier: str, role: str = "user") -> str:
+    payload = {
+        "sub": identifier,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(hours=24),  # Token expires in 24 hours
+        "iat": datetime.utcnow()
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=ALGORITHM)
+
+def validate_jwt_token(token: str) -> Optional[cl.User]:
+    try:
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        user = cl.User(
+            identifier=decoded.get('sub'),
+            metadata={
+                "role": decoded.get('role', 'user'),
+                "authenticated_at": datetime.utcnow().isoformat(),
+                "token_validated_locally": True
+            }
+        )
+        return user
+    except jwt.ExpiredSignatureError:
+        print("JWT token has expired")
+        return None
+    except jwt.InvalidTokenError as e:
+        print(f"Invalid JWT token: {e}")
+        return None
+@app.get("/chainlit/companies")
+async def get_companies(user: cl.User = Depends(header_auth_callback)):
+    companies = await db_manager.list_companies()
+    return companies
+
+@cl.header_auth_callback
+def header_auth_callback(headers: Dict) -> Optional[cl.User]:
+    auth_header = headers.get("authorization") or headers.get("Authorization")
+    if not auth_header:
+        print("No authorization header found")
+        return None
+    
+    try:
+        scheme, token = auth_header.split(" ", 1)
+        if scheme.lower() != "bearer":
+            print("Invalid authorization scheme")
+            return None
+    except ValueError:
+        print("Invalid authorization header format")
+        return None
+    
+    return validate_jwt_token(token)
+
+# FastAPI login endpoint
+@app.post("/login")
+async def login(request: LoginRequest, response: Response):
+    conn = None
+    try:
+        conn = await get_db_connection()
+        # Simple authentication check (replace with your actual logic, e.g., verify password hash)
+        user_record = await conn.fetchrow(
+            "SELECT identifier, metadata FROM users WHERE identifier = $1",
+            request.identifier
+        )
+        if not user_record or request.password != "password":  # Replace with secure password check
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        # Generate JWT
+        token = create_jwt(identifier=request.identifier, role=user_record['metadata'].get('role', 'user') if user_record['metadata'] else 'user')
+        
+        # Set JWT in HTTP-only cookie
+        response.set_cookie(
+            key="chainlit-jwt",
+            value=token,
+            httponly=True,
+            secure=True,  # Use secure=True in production (HTTPS)
+            samesite="strict",
+            max_age=86400  # 24 hours
+        )
+        return {"message": "Login successful", "identifier": request.identifier}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            await connection_pool.release(conn)
+
+async def get_db_connection():
+    global connection_pool
+    if connection_pool is None:
+        await init_connection_pool()
+    try:
+        conn = await asyncio.wait_for(connection_pool.acquire(), timeout=15.0)
+        return conn
+    except asyncio.TimeoutError:
+        raise
+    except Exception as e:
+        raise
 
 async def init_connection_pool():
     global connection_pool
@@ -272,22 +265,6 @@ async def init_connection_pool():
         except Exception as e:
             raise
 
-async def get_db_connection():
-    global connection_pool
-    if connection_pool is None:
-        await init_connection_pool()
-
-    try:
-        conn = await asyncio.wait_for(
-            connection_pool.acquire(),
-            timeout=15.0
-        )
-        return conn
-    except asyncio.TimeoutError:
-        raise
-    except Exception as e:
-        raise
-
 def safe_strftime(date_obj, format_str='%Y-%m-%d %H:%M', default="Not set"):
     return date_obj.strftime(format_str) if date_obj else default
 
@@ -299,8 +276,6 @@ class DatabaseManager:
         conn = None
         try:
             conn = await get_db_connection()
-
-            # Create users table for authenticated users
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -310,8 +285,6 @@ class DatabaseManager:
                     last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
-            # Create companies table (new addition)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS companies (
                     id SERIAL PRIMARY KEY,
@@ -320,8 +293,6 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
-            # Update faq_data table to include company_id
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS faq_data (
                     id SERIAL PRIMARY KEY,
@@ -333,8 +304,6 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
-            # Update doc_data table to include company_id
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS doc_data (
                     id SERIAL PRIMARY KEY,
@@ -349,8 +318,6 @@ class DatabaseManager:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
-            # Update chat_sessions to include user_id
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS chat_sessions (
                     id SERIAL PRIMARY KEY,
@@ -363,7 +330,6 @@ class DatabaseManager:
                     last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id SERIAL PRIMARY KEY,
@@ -374,14 +340,11 @@ class DatabaseManager:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
-            # Add indexes for company-based queries and user-based queries
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_company_id ON faq_data(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_company_id ON doc_data(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_company_id ON chat_sessions(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_identifier ON users(identifier)")
-
             await conn.execute("""
                 CREATE OR REPLACE FUNCTION update_updated_at_column()
                 RETURNS TRIGGER AS $$
@@ -391,20 +354,17 @@ class DatabaseManager:
                 END;
                 $$ language 'plpgsql';
             """)
-
             await conn.execute("""
                 DROP TRIGGER IF EXISTS update_doc_data_updated_at ON doc_data;
                 CREATE TRIGGER update_doc_data_updated_at
                     BEFORE UPDATE ON doc_data
                     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
             """)
-
             await conn.execute("""
                 UPDATE doc_data
                 SET doc_status = 'completed', updated_at = CURRENT_TIMESTAMP
                 WHERE doc_status IS NULL OR doc_status = ''
             """)
-
             await conn.execute("""
                 UPDATE doc_data
                 SET faq_count = (
@@ -414,7 +374,6 @@ class DatabaseManager:
                 )
                 WHERE faq_count = 0 OR faq_count IS NULL
             """)
-
         except Exception as e:
             raise
         finally:
@@ -422,7 +381,6 @@ class DatabaseManager:
                 await connection_pool.release(conn)
 
     async def upsert_user(self, identifier: str, metadata: dict) -> int:
-        """Insert or update user and return user ID"""
         conn = None
         try:
             conn = await get_db_connection()
@@ -443,7 +401,6 @@ class DatabaseManager:
                 await connection_pool.release(conn)
 
     async def get_company_by_identifier(self, identifier: str):
-        """Get company by name or code"""
         conn = None
         try:
             conn = await get_db_connection()
@@ -458,7 +415,6 @@ class DatabaseManager:
                 await connection_pool.release(conn)
 
     async def list_companies(self):
-        """List all available companies"""
         conn = None
         try:
             conn = await get_db_connection()
@@ -474,16 +430,13 @@ class DatabaseManager:
         conn = None
         try:
             conn = await get_db_connection()
-
             session_exists = await conn.fetchrow(
                 "SELECT session_id FROM chat_sessions WHERE session_id = $1",
                 session_id
             )
-
             if not session_exists:
                 client_type = 'copilot' if cl.context.session.client_type == 'copilot' else 'web'
                 user_id = cl.user_session.get("user_id")
-
                 await conn.execute("""
                     INSERT INTO chat_sessions (session_id, user_id, doc_id, company_id, client_type, created_at, last_activity)
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -495,14 +448,11 @@ class DatabaseManager:
                     SET last_activity = $1
                     WHERE session_id = $2
                 """, datetime.now(), session_id)
-
             await conn.execute("""
                 INSERT INTO chat_messages (session_id, role, message, message_type, timestamp)
                 VALUES ($1, $2, $3, $4, $5)
             """, session_id, role, message, message_type, datetime.now())
-
             return True
-
         except Exception as e:
             return False
         finally:
@@ -513,14 +463,12 @@ class DatabaseManager:
         conn = None
         try:
             conn = await get_db_connection()
-
             history_rows = await conn.fetch("""
                 SELECT role, message, message_type, timestamp FROM chat_messages
                 WHERE session_id = $1
                 ORDER BY timestamp DESC
                 LIMIT $2
             """, session_id, limit)
-
             conversation_history = [
                 {
                     'role': row['role'],
@@ -530,9 +478,7 @@ class DatabaseManager:
                 }
                 for row in reversed(history_rows)
             ]
-
             return conversation_history
-
         except Exception as e:
             return []
         finally:
@@ -543,7 +489,6 @@ class DatabaseManager:
         conn = None
         try:
             conn = await get_db_connection()
-
             await conn.execute("""
                 INSERT INTO chat_sessions (session_id, user_id, doc_id, company_id, client_type, created_at, last_activity)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -554,9 +499,7 @@ class DatabaseManager:
                     company_id = COALESCE($4, chat_sessions.company_id),
                     client_type = $5
             """, session_id, user_id, doc_id, company_id, client_type, datetime.now(), datetime.now())
-
             return True
-
         except Exception as e:
             return False
         finally:
@@ -643,7 +586,7 @@ class DatabaseManager:
 
 class ChatbotEngine:
     def __init__(self, api_key):
-        self.client = openai.OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key)
 
     def generate_embedding(self, text):
         try:
@@ -659,7 +602,6 @@ class ChatbotEngine:
         question_embedding = self.generate_embedding(question)
         if not question_embedding:
             return []
-
         relevant_faqs = []
         for faq in faqs_with_embeddings:
             if faq.get('embedding'):
@@ -667,14 +609,12 @@ class ChatbotEngine:
                     [question_embedding],
                     [faq['embedding']]
                 )[0][0]
-
                 if similarity > threshold:
                     relevant_faqs.append({
                         'question': faq['question'],
                         'answer': faq['answer'],
                         'similarity': similarity
                     })
-
         relevant_faqs.sort(key=lambda x: x['similarity'], reverse=True)
         return relevant_faqs[:3]
 
@@ -694,7 +634,6 @@ class ChatbotEngine:
         conn = None
         try:
             conn = await get_db_connection()
-
             if company_id:
                 all_docs = await conn.fetch("""
                     SELECT d.id, d.doc_name, d.doc_path, d.faq_count, d.created_at, d.updated_at, d.doc_status, d.file_size, c.name as company_name
@@ -710,16 +649,13 @@ class ChatbotEngine:
                     LEFT JOIN companies c ON d.company_id = c.id
                     ORDER BY d.doc_name
                 """)
-
             processed_docs = []
             for doc in all_docs:
                 doc_dict = dict(doc)
                 if not doc_dict.get('doc_status') or doc_dict['doc_status'].strip() == '':
                     doc_dict['doc_status'] = 'completed'
                 processed_docs.append(doc_dict)
-
             return processed_docs
-
         except Exception as e:
             return []
         finally:
@@ -749,18 +685,13 @@ class ChatbotEngine:
                 await connection_pool.release(conn)
 
     async def search_policies(self, query: str, company_id: Optional[int] = None, doc_id: Optional[int] = None, limit: int = 5) -> List[Dict]:
-        """Search for relevant policies using vector similarity"""
         query_embedding = self.generate_embedding(query)
         if not query_embedding:
             return []
-
         conn = None
         try:
             conn = await get_db_connection()
-
-            # Build query based on filters
             if doc_id:
-                # Search within specific document
                 faqs = await conn.fetch("""
                     SELECT f.question, f.answer, f.embedding, d.doc_name
                     FROM faq_data f
@@ -768,7 +699,6 @@ class ChatbotEngine:
                     WHERE f.doc_id = $1 AND d.doc_status = 'completed'
                 """, doc_id)
             elif company_id:
-                # Search within company's documents
                 faqs = await conn.fetch("""
                     SELECT f.question, f.answer, f.embedding, d.doc_name
                     FROM faq_data f
@@ -776,7 +706,6 @@ class ChatbotEngine:
                     WHERE f.company_id = $1 AND d.doc_status = 'completed'
                 """, company_id)
             else:
-                # Search all documents
                 faqs = await conn.fetch("""
                     SELECT f.question, f.answer, f.embedding, d.doc_name
                     FROM faq_data f
@@ -784,11 +713,8 @@ class ChatbotEngine:
                     WHERE d.doc_status = 'completed'
                     LIMIT 100
                 """)
-
             if not faqs:
                 return []
-
-            # Calculate similarities
             similarities = []
             for faq in faqs:
                 if faq['embedding']:
@@ -802,11 +728,8 @@ class ChatbotEngine:
                         'doc_name': faq['doc_name'],
                         'similarity': similarity
                     })
-
-            # Sort by similarity and return top results
             similarities.sort(key=lambda x: x['similarity'], reverse=True)
             return similarities[:limit]
-
         except Exception as e:
             print(f"Error searching policies: {e}")
             return []
@@ -818,7 +741,6 @@ class ChatbotEngine:
         conn = None
         try:
             conn = await get_db_connection()
-
             if doc_id:
                 faqs = await conn.fetch("""
                     SELECT question, answer, embedding
@@ -837,20 +759,16 @@ class ChatbotEngine:
                     FROM faq_data
                     LIMIT 100
                 """)
-
             faqs_list = [dict(faq) for faq in faqs]
-
             relevant_context = []
             faqs_with_embeddings = [faq for faq in faqs_list if faq.get('embedding')]
             if faqs_with_embeddings:
                 relevant_context = self.find_relevant_context(question, faqs_with_embeddings)
-
             doc_content = ""
             if doc_id:
                 doc_content = await self.get_document_content(doc_id)
                 if doc_content and len(doc_content) > 3000:
                     doc_content = doc_content[:3000] + "..."
-
             context_text = ""
             if relevant_context:
                 context_text = "Based on the following information from the document:\n\n"
@@ -860,7 +778,6 @@ class ChatbotEngine:
                 context_text = "Based on available document information:\n\n"
                 for faq in faqs_list[:3]:
                     context_text += f"Q: {faq['question']}\nA: {faq['answer']}\n\n"
-
             history_text = ""
             if conversation_history:
                 history_text = "Previous conversation:\n"
@@ -869,10 +786,8 @@ class ChatbotEngine:
                         role = "User" if msg['role'] == 'user' else "Assistant"
                         history_text += f"{role}: {msg['message']}\n"
                 history_text += "\n"
-
             if is_copilot:
                 system_prompt = """You are an AI assistant integrated as a copilot in a policy management system.
-
                 Guidelines:
                 1. Be concise and actionable - users expect quick, focused responses in copilot mode
                 2. Prioritize direct answers over explanatory text
@@ -883,7 +798,6 @@ class ChatbotEngine:
                 7. Keep responses under 200 words unless more detail is specifically requested"""
             else:
                 system_prompt = """You are a helpful AI assistant that answers questions based on uploaded PDF documents.
-
                 Guidelines:
                 1. Be conversational and friendly
                 2. If you have relevant information from the document, use it to answer
@@ -892,16 +806,11 @@ class ChatbotEngine:
                 5. Ask follow-up questions when appropriate
                 6. Be concise but informative
                 7. Always be helpful and engaging"""
-
             user_prompt = f"""
             {history_text}
-
             {context_text}
-
             Current question: {question}
-
             Please provide a helpful{',' if is_copilot else ', conversational'} response based on the available information."""
-
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -912,7 +821,6 @@ class ChatbotEngine:
                 temperature=0.7,
             )
             return response.choices[0].message.content.strip()
-
         except Exception as e:
             return "I'm sorry, I encountered an error while processing your question. Please try again."
         finally:
@@ -923,61 +831,44 @@ class ChatbotEngine:
 db_manager = DatabaseManager()
 chatbot = ChatbotEngine(OPENAI_API_KEY)
 
-# Modified action callbacks - removed admin panel for copilot
 @cl.action_callback("download_policy")
 async def handle_download_action(action):
-    """Enhanced download action with better user feedback"""
     policy_name = action.value
     session_id = cl.user_session.get("session_id")
     company_id = cl.user_session.get("company_id")
-
     if session_id and policy_name and company_id:
-        # Call the copilot function to notify the frontend
         if cl.context.session.client_type == "copilot":
             fn = cl.CopilotFunction(
-                name="download_policy", 
+                name="download_policy",
                 args={"policy_name": policy_name, "status": "starting"}
             )
             await fn.acall()
-
         await download_policy_file(policy_name, session_id, company_id, is_copilot=True)
     else:
         await cl.Message(content="❌ Unable to download policy. Please try again.").send()
 
 @cl.action_callback("select_policy")
 async def handle_select_action(action):
-    """Enhanced policy selection with frontend notification"""
     policy_name = action.value
     session_id = cl.user_session.get("session_id")
     company_id = cl.user_session.get("company_id")
-
     if session_id and policy_name and company_id:
-        # Notify frontend about policy selection
         if cl.context.session.client_type == "copilot":
             fn = cl.CopilotFunction(
-                name="select_policy", 
+                name="select_policy",
                 args={"policy_name": policy_name}
             )
             await fn.acall()
-
         await handle_policy_selection_by_name(policy_name, company_id, is_copilot=True)
     else:
         await cl.Message(content="❌ Unable to select policy. Please try again.").send()
 
-# REMOVED: @cl.action_callback("open_admin") - Admin panel access removed from copilot
-# This action callback has been completely removed to prevent admin access in copilot mode
-
-# Modified functions - admin access removed for copilot
 async def handle_system_message(message: cl.Message, session_id: str):
-    """Handle system messages from the frontend"""
     try:
         content = message.content.strip()
-
-        # Try to parse as JSON for structured data
         try:
             data = json.loads(content)
             message_type = data.get('type', 'unknown')
-
             if message_type == 'demo_interaction':
                 response = f"📊 Demo interaction logged: {data.get('user_message', 'N/A')}"
             elif message_type == 'page_focus':
@@ -992,44 +883,33 @@ async def handle_system_message(message: cl.Message, session_id: str):
                 response = "🐛 I detected a technical issue. Everything should still work normally."
             else:
                 response = f"📨 System message received: {message_type}"
-
         except json.JSONDecodeError:
-            # Handle plain text system messages
             response = f"📋 System update: {content}"
-
         await cl.Message(content=response).send()
         await db_manager.store_message(session_id, 'assistant', response, message_type='system_response')
-
     except Exception as e:
         print(f"Error handling system message: {e}")
 
 async def handle_list_policies_enhanced(session_id: str, company_id: int, is_copilot: bool = False):
-    """Enhanced policy listing with copilot functions - NO ADMIN ACCESS for copilot"""
     try:
         available_docs = await chatbot.get_available_documents(company_id=company_id)
         company_name = cl.user_session.get("company_name", "your company")
-
         if not available_docs:
             response = f"❌ No policies available for {company_name}."
         else:
             if is_copilot:
-                # Send notification to frontend
                 fn = cl.CopilotFunction(
-                    name="show_notification", 
+                    name="show_notification",
                     args={
                         "message": f"Found {len(available_docs)} policies for {company_name}",
                         "type": "success"
                     }
                 )
                 await fn.acall()
-
                 response = f"📚 Available Policies for {company_name} ({len(available_docs)}):\n\n"
-
                 actions = []
-                for doc in available_docs[:5]:  # Limit actions for better UX
+                for doc in available_docs[:5]:
                     response += f"• {doc['doc_name']} (ID: {doc['id']}, FAQs: {doc.get('faq_count', 0)})\n"
-
-                    # Create quick action buttons - NO ADMIN ACCESS
                     actions.extend([
                         cl.Action(
                             name="select_policy",
@@ -1044,16 +924,11 @@ async def handle_list_policies_enhanced(session_id: str, company_id: int, is_cop
                             description=f"Download {doc['doc_name']}"
                         )
                     ])
-
                 if len(available_docs) > 5:
                     response += f"\n... and {len(available_docs) - 5} more policies\n"
-
                 response += "\nQuick Actions:"
-
-                await cl.Message(content=response, actions=actions[:10]).send()  # Limit total actions
-
+                await cl.Message(content=response, actions=actions[:10]).send()
             else:
-                # Regular web interface response - Admin access still available for web
                 response = f"📚 Available Policies for {company_name} ({len(available_docs)}):\n\n"
                 for doc in available_docs:
                     response += f"• {doc['doc_name']} (ID: {doc['id']})\n"
@@ -1061,17 +936,14 @@ async def handle_list_policies_enhanced(session_id: str, company_id: int, is_cop
                     response += f"  - Status: {doc.get('doc_status', 'unknown')}\n"
                     response += f"  - Updated: {safe_strftime(doc.get('updated_at'), default='Never')}\n"
                     response += f"  - Size: {doc.get('file_size', 0)} bytes\n\n"
-
                 response += "Commands:\n"
                 response += "• policy name [id] - Get policy name by ID\n"
                 response += "• policy id [name] - Get policy ID by name\n"
                 response += "• download [policy_name] - Download policy file\n"
                 response += "• show [policy_name] - Show policy details\n"
-                response += "• admin - Access admin panel\n"  # Only for web
-
+                response += "• admin - Access admin panel\n"
         await cl.Message(content=response).send()
         await db_manager.store_message(session_id, 'assistant', response)
-
     except Exception as e:
         print(f"Error listing policies: {str(e)}")
         error_response = "❌ Error retrieving policy list. Please try again."
@@ -1079,37 +951,30 @@ async def handle_list_policies_enhanced(session_id: str, company_id: int, is_cop
         await db_manager.store_message(session_id, 'assistant', error_response)
 
 async def download_policy_with_notification(policy_name: str, session_id: str, company_id: int, is_copilot: bool = False):
-    """Enhanced download with frontend notifications"""
     try:
         if is_copilot:
-            # Notify frontend that download is starting
             fn = cl.CopilotFunction(
-                name="show_notification", 
+                name="show_notification",
                 args={
                     "message": f"Preparing download for {policy_name}...",
                     "type": "info"
                 }
             )
             await fn.acall()
-
-        # Call existing download function
         await download_policy_file(policy_name, session_id, company_id, is_copilot)
-
         if is_copilot:
-            # Notify frontend that download is complete
             fn = cl.CopilotFunction(
-                name="show_notification", 
+                name="show_notification",
                 args={
                     "message": f"Download ready for {policy_name}",
                     "type": "success"
                 }
             )
             await fn.acall()
-
     except Exception as e:
         if is_copilot:
             fn = cl.CopilotFunction(
-                name="show_notification", 
+                name="show_notification",
                 args={
                     "message": f"Download failed for {policy_name}",
                     "type": "error"
@@ -1119,57 +984,42 @@ async def download_policy_with_notification(policy_name: str, session_id: str, c
         raise e
 
 async def handle_admin_command(is_copilot: bool = False):
-    """Handle admin panel access command - BLOCKED for copilot"""
     if is_copilot:
-        # Block admin access for copilot users
         await cl.Message(content="🚫 Admin access is not available in copilot mode. Please use the web interface to access administrative functions.").send()
     else:
-        # Allow admin access for web users
         await cl.Message(content="🔧 Admin Panel Access: http://localhost:8000\n\nUse the admin panel to upload and manage policy documents.").send()
 
 async def send_user_context_update(user_message: str, session_id: str, company_id: int):
-    """Send context updates to the frontend"""
     try:
-        # Get user context
         fn = cl.CopilotFunction(
-            name="get_user_context", 
+            name="get_user_context",
             args={"request_type": "current_state"}
         )
         context_result = await fn.acall()
-
-        # You can use this context for analytics or personalization
         print(f"User context: {context_result}")
-
     except Exception as e:
         print(f"Error getting user context: {e}")
 
 async def enhanced_policy_search(user_message: str, company_id: int, doc_id: int = None, is_copilot: bool = False):
-    """Enhanced search with frontend notifications"""
     if is_copilot:
-        # Notify that search is starting
         fn = cl.CopilotFunction(
-            name="show_notification", 
+            name="show_notification",
             args={
                 "message": "Searching through your policies...",
                 "type": "info"
             }
         )
         await fn.acall()
-
-    # Perform the search
     search_results = await chatbot.search_policies(user_message, company_id=company_id, doc_id=doc_id, limit=3)
-
     if search_results and is_copilot:
-        # Notify about results found
         fn = cl.CopilotFunction(
-            name="show_notification", 
+            name="show_notification",
             args={
                 "message": f"Found {len(search_results)} relevant results",
                 "type": "success"
             }
         )
         await fn.acall()
-
     return search_results
 
 @cl.on_chat_start
@@ -1177,19 +1027,14 @@ async def start():
     try:
         await init_connection_pool()
         await db_manager.init_database()
-        
-        # Get authenticated user
         user = cl.user_session.get("user")
         if not user:
-            await cl.Message(content="❌ Authentication required. Please log in to continue.").send()
+            await cl.Message(content="❌ Authentication required. Please login through the secure web interface to continue.").send()
             return
-        
-        # Store user information in database
         user_id = await db_manager.upsert_user(user.identifier, user.metadata)
         if not user_id:
             await cl.Message(content="❌ Error setting up user session. Please try again.").send()
             return
-        
         session_id = str(uuid.uuid4())
         cl.user_session.set("session_id", session_id)
         cl.user_session.set("user_id", user_id)
@@ -1197,56 +1042,35 @@ async def start():
         cl.user_session.set("doc_name", None)
         cl.user_session.set("company_id", None)
         cl.user_session.set("company_name", None)
-
         is_copilot = cl.context.session.client_type == "copilot"
         client_type = "copilot" if is_copilot else "web"
-
-        # Check if companies exist
         companies = await db_manager.list_companies()
-
         if not companies:
             if is_copilot:
                 welcome_message = f"""🤖 Policy Copilot
-
-👋 Welcome, {user.metadata.get('name', user.identifier)}!
-
-❌ No companies found in the system. Contact your administrator to add company data."""
+                👋 Welcome, {user.metadata.get('name', user.identifier)}!
+                ❌ No companies found in the system. Contact your administrator to add company data."""
             else:
                 welcome_message = f"""👋 Welcome to the Policy Assistant, {user.metadata.get('name', user.identifier)}!
-
-❌ No companies found in the system. Please contact your administrator to add company data."""
-
+                ❌ No companies found in the system. Please contact your administrator to add company data."""
             await cl.Message(content=welcome_message).send()
             return
-
-        # Ask for company selection
         if is_copilot:
-            # For copilot, ask directly
             company_list = "\n".join([f"• {comp['name']} (Code: {comp['code']})" for comp in companies])
-
             company_input = await cl.AskUserMessage(
                 content=f"""🏢 Select your company:
-
-{company_list}
-
-Enter company name or code:"""
+                {company_list}
+                Enter company name or code:"""
             ).send()
         else:
-            # For web interface, show nice formatting
             company_list = "\n".join([f"• {comp['name']} (Code: {comp['code']})" for comp in companies])
-
             company_input = await cl.AskUserMessage(
                 content=f"""🏢 Welcome to the Policy Assistant, {user.metadata.get('name', user.identifier)}!
-
-Please select your company to get started:
-
-Available Companies:
-{company_list}
-
-Enter your company name or code:"""
+                Please select your company to get started:
+                Available Companies:
+                {company_list}
+                Enter your company name or code:"""
             ).send()
-
-        # Handle different response formats
         company_identifier = None
         if isinstance(company_input, dict):
             company_identifier = company_input.get('content') or company_input.get('output')
@@ -1256,63 +1080,46 @@ Enter your company name or code:"""
             company_identifier = company_input
         else:
             company_identifier = str(company_input) if company_input else None
-
         if not company_identifier or not company_identifier.strip():
             await cl.Message(
                 content="❌ No company identifier provided. Please refresh and try again."
             ).send()
             return
-
-        # Find company
         company = await db_manager.get_company_by_identifier(company_identifier.strip())
-
         if not company:
             await cl.Message(
                 content=f"❌ Company '{company_identifier}' not found.\n\nAvailable companies:\n{company_list}\n\nPlease refresh and try again with a valid company name or code."
             ).send()
             return
-
-        # Set company in session
         cl.user_session.set("company_id", company['id'])
         cl.user_session.set("company_name", company['name'])
-
-        # Create session with company info
         success = await db_manager.create_session(session_id, user_id, company_id=company['id'], client_type=client_type)
-
-        # Get available documents for this company
         available_docs = await chatbot.get_available_documents(company_id=company['id'])
-
         if is_copilot:
             if available_docs:
                 docs_summary = f"{len(available_docs)} policies available for {company['name']}"
-                # Modified welcome message for copilot - NO ADMIN MENTION
                 welcome_message = f"""🤖 Policy Copilot Ready
-
-👋 Welcome, {user.metadata.get('name', user.identifier)}!
-🏢 Company: {company['name']}
-📚 Status: {docs_summary}
-
-Quick Commands:
-• Ask about any policy
-• Type policy names for quick access
-• Request downloads or summaries
-• Use "list policies" to see all available policies
-
-Ready to help! 🚀"""
+                👋 Welcome, {user.metadata.get('name', user.identifier)}!
+                🏢 Company: {company['name']}
+                📚 Status: {docs_summary}
+                🔐 Authentication: Secure JWT ({user.metadata.get('role', 'user')})
+                Quick Commands:
+                • Ask about any policy
+                • Type policy names for quick access
+                • Request downloads or summaries
+                • Use "list policies" to see all available policies
+                Ready to help! 🚀"""
             else:
                 welcome_message = f"""🤖 Policy Copilot
-
-👋 Welcome, {user.metadata.get('name', user.identifier)}!
-🏢 Company: {company['name']}
-❌ No policies currently available for your company.
-
-Contact your administrator to upload policies."""
-
+                👋 Welcome, {user.metadata.get('name', user.identifier)}!
+                🏢 Company: {company['name']}
+                🔐 Authentication: Secure JWT ({user.metadata.get('role', 'user')})
+                ❌ No policies currently available for your company.
+                Contact your administrator to upload policies."""
         else:
             if available_docs:
                 policy_options = ["All Policies (Search across all)"]
                 policy_options.extend([f"{doc['doc_name']} ({doc.get('faq_count', 0)} FAQs)" for doc in available_docs])
-
                 settings = await cl.ChatSettings(
                     [
                         Select(
@@ -1323,53 +1130,40 @@ Contact your administrator to upload policies."""
                         )
                     ]
                 ).send()
-
                 cl.user_session.set("available_docs", available_docs)
-
                 selected_policy = settings.get("PolicySelector", policy_options[0])
                 await handle_policy_widget_selection(selected_policy)
-
                 docs_list = "\n".join([
                     f"• {doc['doc_name']} ({doc.get('faq_count', 0)} FAQs) - Status: {doc.get('doc_status', 'unknown')} - Updated: {safe_strftime(doc.get('updated_at'), default='Never')}"
                     for doc in available_docs
                 ])
-
-                # Web interface retains admin access
                 welcome_message = f"""👋 Welcome to {company['name']} Policy Assistant, {user.metadata.get('name', user.identifier)}!
-
-🎯 Current Selection: {selected_policy}
-
-📚 Available Policies:
-{docs_list}
-
-You can:
-• Use the Policy Selector above to switch between policies
-• Type policy name [id] to get the name of a policy by ID
-• Type policy id [name] to get the ID of a policy by name
-• Type download [policy_name] to download a policy document
-• Type list policies to see all available policies
-• Type admin to access the admin panel
-• Ask questions about policies based on your current selection
-
-💬 How can I help you today?
-
-Note: Use the dropdown selector above to change your policy focus, or use text commands for advanced features.
-"""
+                🎯 Current Selection: {selected_policy}
+                🔐 Authentication: Secure JWT ({user.metadata.get('role', 'user')})
+                📚 Available Policies:
+                {docs_list}
+                You can:
+                • Use the Policy Selector above to switch between policies
+                • Type policy name [id] to get the name of a policy by ID
+                • Type policy id [name] to get the ID of a policy by name
+                • Type download [policy_name] to download a policy document
+                • Type list policies to see all available policies
+                • Type admin to access the admin panel
+                • Ask questions about policies based on your current selection
+                💬 How can I help you today?
+                Note: Use the dropdown selector above to change your policy focus, or use text commands for advanced features.
+                """
             else:
                 welcome_message = f"""👋 Welcome to {company['name']} Policy Assistant, {user.metadata.get('name', user.identifier)}!
-
-❌ No policies are currently available for your company.
-
-Please contact your administrator to upload policies, or check back later.
-
-💬 Feel free to ask me questions and I'll do my best to help!"""
-
+                🔐 Authentication: Secure JWT ({user.metadata.get('role', 'user')})
+                ❌ No policies are currently available for your company.
+                Please contact your administrator to upload policies, or check back later.
+                💬 Feel free to ask me questions and I'll do my best to help!"""
         await cl.Message(content=welcome_message).send()
         await db_manager.store_message(session_id, 'assistant', welcome_message)
-
     except Exception as e:
         print(f"Error in chat start: {str(e)}")
-        error_message = "Sorry, there was an error initializing the chat. Please refresh the page."
+        error_message = "Sorry, there was an error initializing the chat. Please refresh the page and login again."
         await cl.Message(content=error_message).send()
 
 @cl.on_settings_update
@@ -1382,20 +1176,17 @@ async def handle_policy_widget_selection(selected_policy: str):
     session_id = cl.user_session.get("session_id")
     available_docs = cl.user_session.get("available_docs", [])
     company_name = cl.user_session.get("company_name", "your company")
-
     if selected_policy == "All Policies (Search across all)":
         cl.user_session.set("doc_id", None)
         cl.user_session.set("doc_name", None)
         response_message = f"🌐 Policy Selection: All Policies for {company_name}\n\nI'll now search across all available policies to answer your questions."
     else:
         policy_display_name = selected_policy.split(" (")[0]
-
         matching_doc = None
         for doc in available_docs:
             if doc['doc_name'] == policy_display_name:
                 matching_doc = doc
                 break
-
         if matching_doc:
             cl.user_session.set("doc_id", matching_doc['id'])
             cl.user_session.set("doc_name", matching_doc['doc_name'])
@@ -1408,95 +1199,68 @@ async def handle_policy_widget_selection(selected_policy: str):
             )
         else:
             response_message = f"❌ Error: Could not find policy '{policy_display_name}'. Please try again."
-
     await cl.Message(content=response_message).send()
     if session_id:
         await db_manager.store_message(session_id, 'assistant', response_message)
 
 @cl.on_message
 async def main(message: cl.Message):
-    """Enhanced message handler with copilot function calling - ADMIN ACCESS BLOCKED for copilot"""
-    # Check if user is authenticated
     user = cl.user_session.get("user")
     if not user:
-        await cl.Message(content="❌ Authentication required. Please log in to continue.").send()
+        await cl.Message(content="❌ Authentication required. Please login through the secure web interface to continue.").send()
         return
-    
     user_message = message.content.strip()
     session_id = cl.user_session.get("session_id")
     doc_id = cl.user_session.get("doc_id")
     company_id = cl.user_session.get("company_id")
     company_name = cl.user_session.get("company_name")
     is_copilot = cl.context.session.client_type == "copilot"
-
     if not session_id:
         await cl.Message(content="Session error. Please refresh the page.").send()
         return
-
     if not company_id:
         await cl.Message(content="Company not selected. Please refresh the page.").send()
         return
-
-    # Handle system messages from the frontend
     if is_copilot and message.type == "system_message":
         await handle_system_message(message, session_id)
         return
-
-    # Store user message
     await db_manager.store_message(session_id, 'user', user_message, message_type=message.type)
-
-    # Enhanced command handling with copilot functions - ADMIN BLOCKED for copilot
     if user_message.lower().startswith("list policies"):
         await handle_list_policies_enhanced(session_id, company_id, is_copilot)
         return
-
     if user_message.lower().startswith("download "):
         policy_name = user_message[9:].strip()
         await download_policy_with_notification(policy_name, session_id, company_id, is_copilot)
         return
-
-    # MODIFIED: Admin command handling - blocked for copilot
     if user_message.lower().startswith("admin") or user_message.lower() == "open admin":
         await handle_admin_command(is_copilot)
         return
-
     if user_message.lower().startswith("policy name "):
         policy_id_str = user_message[12:].strip()
         await handle_policy_name_lookup(policy_id_str, session_id, is_copilot)
         return
-
     if user_message.lower().startswith("policy id "):
         policy_name = user_message[10:].strip()
         await handle_policy_id_lookup(policy_name, session_id, company_id, is_copilot)
         return
-
     if user_message.lower().startswith("show "):
         policy_name = user_message[5:].strip()
         await handle_show_policy(policy_name, session_id, company_id, is_copilot)
         return
-
-    # Handle Copilot test function manually
     if is_copilot and user_message.lower().startswith("test "):
         msg = user_message[5:].strip()
         response = f"You sent: {msg}"
         await cl.Message(content=response).send()
         await db_manager.store_message(session_id, 'assistant', response)
         return
-
-    # Check if user is asking about a specific policy (copilot mode)
     if is_copilot:
         policy_match = await check_policy_mention(user_message, company_id)
         if policy_match:
             await suggest_policy_actions(policy_match, user_message)
             return
-
-    # Handle natural language queries with vector search
     try:
-        # First try vector search for better results
         search_results = await enhanced_policy_search(user_message, company_id, doc_id, is_copilot)
-
         if search_results:
-            # Format search results
             if is_copilot:
                 response = f"Found {len(search_results)} relevant results:\n\n"
                 for i, result in enumerate(search_results, 1):
@@ -1505,118 +1269,85 @@ async def main(message: cl.Message):
                     response += f"{result['answer']}\n\n"
             else:
                 response = f"""📋 Policy Information for: "{user_message}"
-
-"""
+                """
                 for i, result in enumerate(search_results, 1):
                     confidence = result['similarity'] * 100
                     response += f"""{i}. From: {result['doc_name']} (Confidence: {confidence:.0f}%)
-
-Q: {result['question']}
-A: {result['answer']}
-
----
-
-"""
+                    Q: {result['question']}
+                    A: {result['answer']}
+                    ---
+                    """
                 response += f"""💡 Need more specific information?
-• Type "show [policy_name]" for complete policy details
-• Ask a more specific question
-• Type "list policies" to see all available policies"""
-
+                • Type "show [policy_name]" for complete policy details
+                • Ask a more specific question
+                • Type "list policies" to see all available policies"""
             await cl.Message(content=response).send()
             await db_manager.store_message(session_id, 'assistant', response)
             return
-
-        # Fallback to conversation-based response
         conversation_history = await db_manager.get_conversation_history(session_id, limit=10)
-
         response = await chatbot.generate_response(
-            user_message, 
-            conversation_history, 
+            user_message,
+            conversation_history,
             doc_id=doc_id,
             company_id=company_id,
             is_copilot=is_copilot
         )
-
         await cl.Message(content=response).send()
-
         await db_manager.store_message(session_id, 'assistant', response)
-
     except Exception as e:
         print(f"Error in main message handler: {str(e)}")
         error_response = "I'm sorry, I encountered an error while processing your question. Please try again."
         await cl.Message(content=error_response).send()
         await db_manager.store_message(session_id, 'assistant', error_response)
 
-# Completion of remaining functions
 async def handle_show_policy(policy_name: str, session_id: str, company_id: int, is_copilot: bool = False):
-    """Handle show specific policy command"""
     try:
         policy_info = await get_policy_details(policy_name, company_id)
-
         if not policy_info:
             await cl.Message(
                 content=f"""❌ Policy "{policy_name}" not found.
-
-Type "list policies" to see all available documents."""
+                Type "list policies" to see all available documents."""
             ).send()
             return
-
         policy = policy_info['policy']
         faqs = policy_info['faqs']
-
         created_date = safe_strftime(policy.get('created_at'), '%Y-%m-%d %H:%M', 'Unknown')
-
         if is_copilot:
             response = f"""📄 {policy['doc_name']}
-
-📅 Added: {created_date}
-🤖 FAQs: {policy.get('total_faqs', len(faqs))}
-
-Key Information:
-"""
-            for i, faq in enumerate(faqs[:3], 1):  # Limit for copilot
+            📅 Added: {created_date}
+            🤖 FAQs: {policy.get('total_faqs', len(faqs))}
+            Key Information:
+            """
+            for i, faq in enumerate(faqs[:3], 1):
                 response += f"{i}. {faq['answer'][:100]}{'...' if len(faq['answer']) > 100 else ''}\n"
         else:
             response = f"""📄 Policy Document: {policy['doc_name']}
-
-📅 Added: {created_date}
-🤖 Total FAQs: {policy.get('total_faqs', len(faqs))}
-
-📋 Frequently Asked Questions:
-
-"""
-
+            📅 Added: {created_date}
+            🤖 Total FAQs: {policy.get('total_faqs', len(faqs))}
+            📋 Frequently Asked Questions:
+            """
             for i, faq in enumerate(faqs, 1):
                 response += f"{i}. {faq['question']}\n"
                 response += f"{faq['answer']}\n\n"
-
             response += "💡 Need more information? Just ask me any specific question about this policy!"
-
         await cl.Message(content=response).send()
         await db_manager.store_message(session_id, 'assistant', response)
-
     except Exception as e:
         print(f"Error showing policy: {e}")
         await cl.Message(content="❌ Error retrieving policy details.").send()
 
 async def get_policy_details(policy_name: str, company_id: int):
-    """Get detailed information about a specific policy"""
     conn = None
     try:
         conn = await get_db_connection()
-
-        # Get policy document info
         policy = await conn.fetchrow("""
             SELECT doc_name, doc_content, created_at, faq_count as total_faqs
             FROM doc_data
             WHERE LOWER(doc_name) LIKE LOWER($1) AND company_id = $2 AND doc_status = 'completed'
             LIMIT 1
         """, f"%{policy_name}%", company_id)
-
         if not policy:
             return None
-
-        # Get FAQs for this policy
         faqs = await conn.fetch("""
             SELECT f.question, f.answer
             FROM faq_data f
@@ -1624,7 +1355,6 @@ async def get_policy_details(policy_name: str, company_id: int):
             WHERE LOWER(d.doc_name) LIKE LOWER($1) AND f.company_id = $2
             ORDER BY f.id
         """, f"%{policy_name}%", company_id)
-
         return {
             'policy': dict(policy),
             'faqs': [dict(faq) for faq in faqs]
@@ -1639,47 +1369,38 @@ async def get_policy_details(policy_name: str, company_id: int):
 async def download_policy_file(policy_name: str, session_id: str, company_id: int, is_copilot: bool = False):
     try:
         policy_details = await db_manager.get_policy_details_by_name(policy_name, company_id)
-
         if not policy_details:
             response = f"❌ Policy not found: '{policy_name}'"
             await cl.Message(content=response).send()
             await db_manager.store_message(session_id, 'assistant', response)
             return
-
         policy_path = policy_details['doc_path']
         policy_full_name = policy_details['doc_name']
-
         if not os.path.exists(policy_path):
             response = f"❌ File not found: {policy_full_name}\nPath: {policy_path}"
             await cl.Message(content=response).send()
             await db_manager.store_message(session_id, 'assistant', response)
             return
-
         try:
             file_element = cl.File(
                 name=os.path.basename(policy_path),
                 path=policy_path,
                 display="inline"
             )
-
             if is_copilot:
                 response = f"📄 {policy_full_name} - Download ready"
             else:
                 response = f"📄 Download Ready: {policy_full_name}\n\n📁 File: {os.path.basename(policy_path)}"
-
             await cl.Message(
                 content=response,
                 elements=[file_element]
             ).send()
-
             await db_manager.store_message(session_id, 'assistant', f"Downloaded policy: {policy_full_name}")
-
         except Exception as file_error:
             print(f"File creation error: {str(file_error)}")
             response = f"❌ Download Error: Could not prepare file for download.\nPolicy: {policy_full_name}"
             await cl.Message(content=response).send()
             await db_manager.store_message(session_id, 'assistant', response)
-
     except Exception as e:
         print(f"Error in download_policy_file: {str(e)}")
         error_response = f"❌ Error downloading policy: {policy_name}"
@@ -1690,7 +1411,6 @@ async def handle_policy_name_lookup(policy_id_str: str, session_id: str, is_copi
     try:
         policy_id = int(policy_id_str)
         policy_name = await db_manager.get_policy_name_by_id(policy_id)
-
         if policy_name:
             if is_copilot:
                 response = f"📄 ID {policy_id}: {policy_name}"
@@ -1698,10 +1418,8 @@ async def handle_policy_name_lookup(policy_id_str: str, session_id: str, is_copi
                 response = f"📄 Policy Name for ID {policy_id}:\n\n{policy_name}"
         else:
             response = f"❌ No policy found with ID: {policy_id}"
-
         await cl.Message(content=response).send()
         await db_manager.store_message(session_id, 'assistant', response)
-
     except ValueError:
         response = f"❌ Invalid ID format: '{policy_id_str}' (must be a number)"
         await cl.Message(content=response).send()
@@ -1715,7 +1433,6 @@ async def handle_policy_name_lookup(policy_id_str: str, session_id: str, is_copi
 async def handle_policy_id_lookup(policy_name: str, session_id: str, company_id: int, is_copilot: bool = False):
     try:
         policy_id = await db_manager.get_policy_id_by_name(policy_name, company_id)
-
         if policy_id:
             if is_copilot:
                 response = f"🔢 '{policy_name}': ID {policy_id}"
@@ -1723,10 +1440,8 @@ async def handle_policy_id_lookup(policy_name: str, session_id: str, company_id:
                 response = f"🔢 Policy ID for '{policy_name}':\n\nID: {policy_id}"
         else:
             response = f"❌ No policy found matching: '{policy_name}'"
-
         await cl.Message(content=response).send()
         await db_manager.store_message(session_id, 'assistant', response)
-
     except Exception as e:
         print(f"Error in policy ID lookup: {str(e)}")
         error_response = "❌ Error looking up policy ID."
@@ -1737,7 +1452,6 @@ async def check_policy_mention(user_message: str, company_id: int) -> Optional[D
     try:
         available_docs = await chatbot.get_available_documents(company_id=company_id)
         user_lower = user_message.lower()
-
         for doc in available_docs:
             doc_name_lower = doc['doc_name'].lower()
             if doc_name_lower in user_lower or any(word in user_lower for word in doc_name_lower.split() if len(word) > 3):
@@ -1758,8 +1472,6 @@ async def suggest_policy_actions(policy_match: Dict, user_message: str):
         policy_id = policy_match['id']
         faq_count = policy_match.get('faq_count', 0)
         company_id = cl.user_session.get("company_id")
-
-        # NO ADMIN ACTIONS for copilot - only policy-specific actions
         actions = [
             cl.Action(
                 name="select_policy",
@@ -1774,31 +1486,24 @@ async def suggest_policy_actions(policy_match: Dict, user_message: str):
                 description=f"Download policy document"
             )
         ]
-
         response = f"🎯 Detected Policy: {policy_name}\n\n📊 FAQs Available: {faq_count}\n\nQuick Actions:"
-
         await cl.Message(
             content=response,
             actions=actions
         ).send()
-
         session_id = cl.user_session.get("session_id")
         conversation_history = await db_manager.get_conversation_history(session_id, limit=5)
-
         policy_response = await chatbot.generate_response(
-            user_message, 
-            conversation_history, 
+            user_message,
+            conversation_history,
             doc_id=policy_id,
             company_id=company_id,
             is_copilot=True
         )
-
         await cl.Message(content=f"About {policy_name}:\n\n{policy_response}").send()
-
         if session_id:
             await db_manager.store_message(session_id, 'assistant', response)
             await db_manager.store_message(session_id, 'assistant', f"About {policy_name}: {policy_response}")
-
     except Exception as e:
         print(f"Error suggesting policy actions: {str(e)}")
         session_id = cl.user_session.get("session_id")
@@ -1810,15 +1515,12 @@ async def suggest_policy_actions(policy_match: Dict, user_message: str):
 async def handle_policy_selection_by_name(policy_name: str, company_id: int, is_copilot: bool = False):
     try:
         policy_details = await db_manager.get_policy_details_by_name(policy_name, company_id)
-
         if not policy_details:
             response = f"❌ Policy not found: '{policy_name}'"
             await cl.Message(content=response).send()
             return
-
         cl.user_session.set("doc_id", policy_details['id'])
         cl.user_session.set("doc_name", policy_details['doc_name'])
-
         if is_copilot:
             response = f"✅ Selected: {policy_details['doc_name']}\n\n🎯 Ready to answer questions about this policy"
         else:
@@ -1828,13 +1530,10 @@ async def handle_policy_selection_by_name(policy_name: str, company_id: int, is_
                 f"📁 Path: {policy_details['doc_path']}\n\n"
                 f"I'll now focus my responses on this specific policy."
             )
-
         await cl.Message(content=response).send()
-
         session_id = cl.user_session.get("session_id")
         if session_id:
             await db_manager.store_message(session_id, 'assistant', response)
-
     except Exception as e:
         print(f"Error in handle_policy_selection_by_name: {str(e)}")
         error_response = f"❌ Error selecting policy: {policy_name}"
@@ -1848,4 +1547,9 @@ async def cleanup():
 if __name__ == "__main__":
     import atexit
     atexit.register(lambda: asyncio.run(cleanup()))
-    cl.run()
+    print("🔐 Secure Policy Assistant Starting...")
+    print(f"Database URL: {'✅ Configured' if DATABASE_URL else '❌ Missing'}")
+    print(f"OpenAI API Key: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
+    print(f"JWT Secret: {'✅ Configured' if JWT_SECRET else '❌ Missing'}")
+    print("🚀 Ready for secure authentication!")
+    cl.run(fastapi_app=app)
