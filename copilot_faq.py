@@ -161,12 +161,6 @@ async def start():
             content=f"""🎉 **Welcome to your FAQ Assistant!**
 
 I'm here to help you find answers from the documents.
-
-**🔍 What I can help you with:**
-• Questions about company policies
-• Product information  
-• Process guidelines
-• Any topic covered in your uploaded documents
 """,
         ).send()
         
