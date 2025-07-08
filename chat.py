@@ -13,12 +13,24 @@ import asyncio
 from chainlit.data.chainlit_data_layer import ChainlitDataLayer
 from typing import Any, Dict, List, Optional
 import jwt
-from fastapi import FastAPI, Response, HTTPException, Depends
+from fastapi import FastAPI, Response, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+import bcrypt
 
-# FastAPI app for login endpoint
-app = FastAPI()
+# FastAPI app for authentication endpoints
+app = FastAPI(title="Policy Assistant API", version="1.0.0")
+security = HTTPBearer()
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8080", "http://localhost:8000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Custom ChainlitDataLayer to fix parameter type mismatch
 class CustomChainlitDataLayer(ChainlitDataLayer):
@@ -109,22 +121,7 @@ class CustomChainlitDataLayer(ChainlitDataLayer):
             return await super().create_step(step_dict)
         except Exception as e:
             return None
-def header_auth_callback(headers: Dict) -> Optional[cl.User]:
-    auth_header = headers.get("authorization") or headers.get("Authorization")
-    if not auth_header:
-        print("No authorization header found")
-        return None
-    
-    try:
-        scheme, token = auth_header.split(" ", 1)
-        if scheme.lower() != "bearer":
-            print("Invalid authorization scheme")
-            return None
-    except ValueError:
-        print("Invalid authorization header format")
-        return None
-    
-    return validate_jwt_token(token)
+
 # Load environment variables
 load_dotenv()
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -150,11 +147,75 @@ connection_pool = None
 
 # JWT settings
 ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
 
-# Pydantic model for login request
+# Pydantic models for authentication
+class UserSignup(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: Optional[str] = "user"
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str
+    user: dict
+
 class LoginRequest(BaseModel):
     identifier: str
     password: str
+    metadata: Optional[dict] = None
+
+# Authentication helper functions
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({"exp": expire, "type": "access"})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def create_refresh_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str, token_type: str = "access"):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        if payload.get("type") != token_type:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type"
+            )
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired"
+        )
+    except jwt.JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
 
 def create_jwt(identifier: str, role: str = "user") -> str:
     payload = {
@@ -183,10 +244,6 @@ def validate_jwt_token(token: str) -> Optional[cl.User]:
     except jwt.InvalidTokenError as e:
         print(f"Invalid JWT token: {e}")
         return None
-@app.get("/chainlit/companies")
-async def get_companies(user: cl.User = Depends(header_auth_callback)):
-    companies = await db_manager.list_companies()
-    return companies
 
 @cl.header_auth_callback
 def header_auth_callback(headers: Dict) -> Optional[cl.User]:
@@ -206,30 +263,199 @@ def header_auth_callback(headers: Dict) -> Optional[cl.User]:
     
     return validate_jwt_token(token)
 
-# FastAPI login endpoint
-@app.post("/login")
-async def login(request: LoginRequest, response: Response):
+# FastAPI authentication endpoints
+@app.post("/auth/signup", response_model=dict)
+async def signup(user_data: UserSignup):
     conn = None
     try:
         conn = await get_db_connection()
-        # Simple authentication check (replace with your actual logic, e.g., verify password hash)
+        # Check if user exists
+        existing_user = conn.execute(
+            "SELECT id FROM auth_users WHERE email = $1", 
+            user_data.email
+        ).fetchone()
+        
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        
+        # Create user
+        password_hash = hash_password(user_data.password)
+        result = await conn.fetchrow("""
+            INSERT INTO auth_users (name, email, password_hash, role)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+        """, user_data.name, user_data.email, password_hash, user_data.role)
+        
+        return {"message": "User created successfully", "user_id": result['id']}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            await connection_pool.release(conn)
+
+@app.post("/auth/login", response_model=Token)
+async def login(user_credentials: UserLogin):
+    conn = None
+    try:
+        conn = await get_db_connection()
+        user = await conn.fetchrow(
+            "SELECT * FROM auth_users WHERE email = $1 AND is_active = true", 
+            user_credentials.email
+        )
+        
+        if not user or not verify_password(user_credentials.password, user["password_hash"]):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
+        
+        # Create tokens
+        access_token = create_access_token(data={"sub": user["email"]})
+        refresh_token = create_refresh_token(data={"sub": user["email"]})
+        
+        # Update last login
+        await conn.execute(
+            "UPDATE auth_users SET last_login = CURRENT_TIMESTAMP WHERE id = $1",
+            user["id"]
+        )
+        
+        # Also create/update the chainlit user record
+        await db_manager.upsert_user(user["email"], {
+            "name": user["name"],
+            "role": user["role"],
+            "email": user["email"]
+        })
+        
+        user_data = {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+            "role": user["role"]
+        }
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "user": user_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            await connection_pool.release(conn)
+
+@app.post("/auth/refresh")
+async def refresh_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    refresh_token = credentials.credentials
+    payload = verify_token(refresh_token, "refresh")
+    user_email = payload.get("sub")
+    
+    if not user_email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token"
+        )
+    
+    # Create new access token
+    new_access_token = create_access_token(data={"sub": user_email})
+    
+    return {"access_token": new_access_token, "token_type": "bearer"}
+
+@app.get("/auth/verify")
+async def verify_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    payload = verify_token(token)
+    user_email = payload.get("sub")
+    
+    if not user_email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+    
+    conn = None
+    try:
+        conn = await get_db_connection()
+        user = await conn.fetchrow(
+            "SELECT * FROM auth_users WHERE email = $1 AND is_active = true", 
+            user_email
+        )
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found"
+            )
+        
+        return {"message": "Token is valid", "user": dict(user)}
+    finally:
+        if conn:
+            await connection_pool.release(conn)
+
+@app.post("/auth/logout")
+async def logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    # In a production environment, you'd want to blacklist the token
+    return {"message": "Logged out successfully"}
+
+# Legacy login endpoint for backward compatibility
+@app.post("/login")
+async def legacy_login(request: LoginRequest, response: Response):
+    conn = None
+    try:
+        conn = await get_db_connection()
+        # For backward compatibility, try to find user by identifier or email
         user_record = await conn.fetchrow(
             "SELECT identifier, metadata FROM users WHERE identifier = $1",
             request.identifier
         )
+        
+        if not user_record:
+            # Try to find by email in auth_users table
+            auth_user = await conn.fetchrow(
+                "SELECT email, name, role FROM auth_users WHERE email = $1",
+                request.identifier
+            )
+            if auth_user and request.password == "password":  # Replace with secure password check
+                # Create user record in legacy users table
+                metadata = {
+                    "name": auth_user["name"],
+                    "role": auth_user["role"],
+                    "email": auth_user["email"]
+                }
+                await conn.execute("""
+                    INSERT INTO users (identifier, metadata, last_login)
+                    VALUES ($1, $2, CURRENT_TIMESTAMP)
+                    ON CONFLICT (identifier) DO UPDATE SET
+                        metadata = $2,
+                        last_login = CURRENT_TIMESTAMP
+                """, request.identifier, json.dumps(metadata))
+                user_record = {"identifier": request.identifier, "metadata": metadata}
+        
         if not user_record or request.password != "password":  # Replace with secure password check
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
         # Generate JWT
-        token = create_jwt(identifier=request.identifier, role=user_record['metadata'].get('role', 'user') if user_record['metadata'] else 'user')
+        role = "user"
+        if user_record['metadata']:
+            if isinstance(user_record['metadata'], str):
+                metadata = json.loads(user_record['metadata'])
+            else:
+                metadata = user_record['metadata']
+            role = metadata.get('role', 'user')
+        
+        token = create_jwt(identifier=request.identifier, role=role)
         
         # Set JWT in HTTP-only cookie
         response.set_cookie(
             key="chainlit-jwt",
             value=token,
             httponly=True,
-            secure=True,  # Use secure=True in production (HTTPS)
-            samesite="strict",
+            secure=False,  # Set to True in production (HTTPS)
+            samesite="lax",
             max_age=86400  # 24 hours
         )
         return {"message": "Login successful", "identifier": request.identifier}
@@ -238,6 +464,11 @@ async def login(request: LoginRequest, response: Response):
     finally:
         if conn:
             await connection_pool.release(conn)
+
+@app.get("/chainlit/companies")
+async def get_companies():
+    companies = await db_manager.list_companies()
+    return companies
 
 async def get_db_connection():
     global connection_pool
@@ -276,6 +507,30 @@ class DatabaseManager:
         conn = None
         try:
             conn = await get_db_connection()
+            
+            # Create auth_users table for JWT authentication
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS auth_users (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    email VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role VARCHAR(50) DEFAULT 'user',
+                    is_active BOOLEAN DEFAULT true,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create demo user if it doesn't exist
+            demo_password = hash_password("demo123")
+            await conn.execute("""
+                INSERT INTO auth_users (name, email, password_hash, role)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (email) DO NOTHING
+            """, "Demo User", "demo@company.com", demo_password, "admin")
+            
+            # Legacy users table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -285,6 +540,7 @@ class DatabaseManager:
                     last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS companies (
                     id SERIAL PRIMARY KEY,
@@ -340,11 +596,16 @@ class DatabaseManager:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            
+            # Create indexes
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_company_id ON faq_data(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_company_id ON doc_data(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_company_id ON chat_sessions(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_identifier ON users(identifier)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_users_email ON auth_users(email)")
+            
+            # Create trigger for updated_at
             await conn.execute("""
                 CREATE OR REPLACE FUNCTION update_updated_at_column()
                 RETURNS TRIGGER AS $$
@@ -360,6 +621,8 @@ class DatabaseManager:
                     BEFORE UPDATE ON doc_data
                     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
             """)
+            
+            # Update existing data
             await conn.execute("""
                 UPDATE doc_data
                 SET doc_status = 'completed', updated_at = CURRENT_TIMESTAMP
@@ -1031,10 +1294,18 @@ async def start():
         if not user:
             await cl.Message(content="❌ Authentication required. Please login through the secure web interface to continue.").send()
             return
-        user_id = await db_manager.upsert_user(user.identifier, user.metadata)
+        
+        # Enhanced user validation for JWT
+        if not hasattr(user, 'identifier') or not user.identifier:
+            await cl.Message(content="❌ Invalid user session. Please login again.").send()
+            return
+            
+        user_metadata = user.metadata or {}
+        user_id = await db_manager.upsert_user(user.identifier, user_metadata)
         if not user_id:
             await cl.Message(content="❌ Error setting up user session. Please try again.").send()
             return
+            
         session_id = str(uuid.uuid4())
         cl.user_session.set("session_id", session_id)
         cl.user_session.set("user_id", user_id)
@@ -1042,19 +1313,22 @@ async def start():
         cl.user_session.set("doc_name", None)
         cl.user_session.set("company_id", None)
         cl.user_session.set("company_name", None)
+        
         is_copilot = cl.context.session.client_type == "copilot"
         client_type = "copilot" if is_copilot else "web"
+        
         companies = await db_manager.list_companies()
         if not companies:
             if is_copilot:
                 welcome_message = f"""🤖 Policy Copilot
-                👋 Welcome, {user.metadata.get('name', user.identifier)}!
+                👋 Welcome, {user_metadata.get('name', user.identifier)}!
                 ❌ No companies found in the system. Contact your administrator to add company data."""
             else:
-                welcome_message = f"""👋 Welcome to the Policy Assistant, {user.metadata.get('name', user.identifier)}!
+                welcome_message = f"""👋 Welcome to the Policy Assistant, {user_metadata.get('name', user.identifier)}!
                 ❌ No companies found in the system. Please contact your administrator to add company data."""
             await cl.Message(content=welcome_message).send()
             return
+            
         if is_copilot:
             company_list = "\n".join([f"• {comp['name']} (Code: {comp['code']})" for comp in companies])
             company_input = await cl.AskUserMessage(
@@ -1065,12 +1339,13 @@ async def start():
         else:
             company_list = "\n".join([f"• {comp['name']} (Code: {comp['code']})" for comp in companies])
             company_input = await cl.AskUserMessage(
-                content=f"""🏢 Welcome to the Policy Assistant, {user.metadata.get('name', user.identifier)}!
+                content=f"""🏢 Welcome to the Policy Assistant, {user_metadata.get('name', user.identifier)}!
                 Please select your company to get started:
                 Available Companies:
                 {company_list}
                 Enter your company name or code:"""
             ).send()
+            
         company_identifier = None
         if isinstance(company_input, dict):
             company_identifier = company_input.get('content') or company_input.get('output')
@@ -1080,40 +1355,48 @@ async def start():
             company_identifier = company_input
         else:
             company_identifier = str(company_input) if company_input else None
+            
         if not company_identifier or not company_identifier.strip():
             await cl.Message(
                 content="❌ No company identifier provided. Please refresh and try again."
             ).send()
             return
+            
         company = await db_manager.get_company_by_identifier(company_identifier.strip())
         if not company:
             await cl.Message(
                 content=f"❌ Company '{company_identifier}' not found.\n\nAvailable companies:\n{company_list}\n\nPlease refresh and try again with a valid company name or code."
             ).send()
             return
+            
         cl.user_session.set("company_id", company['id'])
         cl.user_session.set("company_name", company['name'])
+        
         success = await db_manager.create_session(session_id, user_id, company_id=company['id'], client_type=client_type)
+        
         available_docs = await chatbot.get_available_documents(company_id=company['id'])
+        
         if is_copilot:
             if available_docs:
                 docs_summary = f"{len(available_docs)} policies available for {company['name']}"
                 welcome_message = f"""🤖 Policy Copilot Ready
-                👋 Welcome, {user.metadata.get('name', user.identifier)}!
+                👋 Welcome, {user_metadata.get('name', user.identifier)}!
                 🏢 Company: {company['name']}
                 📚 Status: {docs_summary}
-                🔐 Authentication: Secure JWT ({user.metadata.get('role', 'user')})
+                🔐 Authentication: Secure JWT ({user_metadata.get('role', 'user')})
+                
                 Quick Commands:
                 • Ask about any policy
                 • Type policy names for quick access
                 • Request downloads or summaries
                 • Use "list policies" to see all available policies
+                
                 Ready to help! 🚀"""
             else:
                 welcome_message = f"""🤖 Policy Copilot
-                👋 Welcome, {user.metadata.get('name', user.identifier)}!
+                👋 Welcome, {user_metadata.get('name', user.identifier)}!
                 🏢 Company: {company['name']}
-                🔐 Authentication: Secure JWT ({user.metadata.get('role', 'user')})
+                🔐 Authentication: Secure JWT ({user_metadata.get('role', 'user')})
                 ❌ No policies currently available for your company.
                 Contact your administrator to upload policies."""
         else:
@@ -1137,11 +1420,13 @@ async def start():
                     f"• {doc['doc_name']} ({doc.get('faq_count', 0)} FAQs) - Status: {doc.get('doc_status', 'unknown')} - Updated: {safe_strftime(doc.get('updated_at'), default='Never')}"
                     for doc in available_docs
                 ])
-                welcome_message = f"""👋 Welcome to {company['name']} Policy Assistant, {user.metadata.get('name', user.identifier)}!
+                welcome_message = f"""👋 Welcome to {company['name']} Policy Assistant, {user_metadata.get('name', user.identifier)}!
                 🎯 Current Selection: {selected_policy}
-                🔐 Authentication: Secure JWT ({user.metadata.get('role', 'user')})
+                🔐 Authentication: Secure JWT ({user_metadata.get('role', 'user')})
+                
                 📚 Available Policies:
                 {docs_list}
+                
                 You can:
                 • Use the Policy Selector above to switch between policies
                 • Type policy name [id] to get the name of a policy by ID
@@ -1150,15 +1435,18 @@ async def start():
                 • Type list policies to see all available policies
                 • Type admin to access the admin panel
                 • Ask questions about policies based on your current selection
+                
                 💬 How can I help you today?
+                
                 Note: Use the dropdown selector above to change your policy focus, or use text commands for advanced features.
                 """
             else:
-                welcome_message = f"""👋 Welcome to {company['name']} Policy Assistant, {user.metadata.get('name', user.identifier)}!
-                🔐 Authentication: Secure JWT ({user.metadata.get('role', 'user')})
+                welcome_message = f"""👋 Welcome to {company['name']} Policy Assistant, {user_metadata.get('name', user.identifier)}!
+                🔐 Authentication: Secure JWT ({user_metadata.get('role', 'user')})
                 ❌ No policies are currently available for your company.
                 Please contact your administrator to upload policies, or check back later.
                 💬 Feel free to ask me questions and I'll do my best to help!"""
+                
         await cl.Message(content=welcome_message).send()
         await db_manager.store_message(session_id, 'assistant', welcome_message)
     except Exception as e:
@@ -1209,55 +1497,68 @@ async def main(message: cl.Message):
     if not user:
         await cl.Message(content="❌ Authentication required. Please login through the secure web interface to continue.").send()
         return
+    
     user_message = message.content.strip()
     session_id = cl.user_session.get("session_id")
     doc_id = cl.user_session.get("doc_id")
     company_id = cl.user_session.get("company_id")
     company_name = cl.user_session.get("company_name")
     is_copilot = cl.context.session.client_type == "copilot"
+    
     if not session_id:
         await cl.Message(content="Session error. Please refresh the page.").send()
         return
     if not company_id:
         await cl.Message(content="Company not selected. Please refresh the page.").send()
         return
+    
     if is_copilot and message.type == "system_message":
         await handle_system_message(message, session_id)
         return
+    
     await db_manager.store_message(session_id, 'user', user_message, message_type=message.type)
+    
     if user_message.lower().startswith("list policies"):
         await handle_list_policies_enhanced(session_id, company_id, is_copilot)
         return
+    
     if user_message.lower().startswith("download "):
         policy_name = user_message[9:].strip()
         await download_policy_with_notification(policy_name, session_id, company_id, is_copilot)
         return
+    
     if user_message.lower().startswith("admin") or user_message.lower() == "open admin":
         await handle_admin_command(is_copilot)
         return
+    
     if user_message.lower().startswith("policy name "):
         policy_id_str = user_message[12:].strip()
         await handle_policy_name_lookup(policy_id_str, session_id, is_copilot)
         return
+    
     if user_message.lower().startswith("policy id "):
         policy_name = user_message[10:].strip()
         await handle_policy_id_lookup(policy_name, session_id, company_id, is_copilot)
         return
+    
     if user_message.lower().startswith("show "):
         policy_name = user_message[5:].strip()
         await handle_show_policy(policy_name, session_id, company_id, is_copilot)
         return
+    
     if is_copilot and user_message.lower().startswith("test "):
         msg = user_message[5:].strip()
         response = f"You sent: {msg}"
         await cl.Message(content=response).send()
         await db_manager.store_message(session_id, 'assistant', response)
         return
+    
     if is_copilot:
         policy_match = await check_policy_mention(user_message, company_id)
         if policy_match:
             await suggest_policy_actions(policy_match, user_message)
             return
+    
     try:
         search_results = await enhanced_policy_search(user_message, company_id, doc_id, is_copilot)
         if search_results:
@@ -1284,6 +1585,7 @@ async def main(message: cl.Message):
             await cl.Message(content=response).send()
             await db_manager.store_message(session_id, 'assistant', response)
             return
+        
         conversation_history = await db_manager.get_conversation_history(session_id, limit=10)
         response = await chatbot.generate_response(
             user_message,
@@ -1309,13 +1611,16 @@ async def handle_show_policy(policy_name: str, session_id: str, company_id: int,
                 Type "list policies" to see all available documents."""
             ).send()
             return
+        
         policy = policy_info['policy']
         faqs = policy_info['faqs']
         created_date = safe_strftime(policy.get('created_at'), '%Y-%m-%d %H:%M', 'Unknown')
+        
         if is_copilot:
             response = f"""📄 {policy['doc_name']}
             📅 Added: {created_date}
             🤖 FAQs: {policy.get('total_faqs', len(faqs))}
+            
             Key Information:
             """
             for i, faq in enumerate(faqs[:3], 1):
@@ -1324,12 +1629,14 @@ async def handle_show_policy(policy_name: str, session_id: str, company_id: int,
             response = f"""📄 Policy Document: {policy['doc_name']}
             📅 Added: {created_date}
             🤖 Total FAQs: {policy.get('total_faqs', len(faqs))}
+            
             📋 Frequently Asked Questions:
             """
             for i, faq in enumerate(faqs, 1):
                 response += f"{i}. {faq['question']}\n"
                 response += f"{faq['answer']}\n\n"
             response += "💡 Need more information? Just ask me any specific question about this policy!"
+        
         await cl.Message(content=response).send()
         await db_manager.store_message(session_id, 'assistant', response)
     except Exception as e:
@@ -1346,8 +1653,10 @@ async def get_policy_details(policy_name: str, company_id: int):
             WHERE LOWER(doc_name) LIKE LOWER($1) AND company_id = $2 AND doc_status = 'completed'
             LIMIT 1
         """, f"%{policy_name}%", company_id)
+        
         if not policy:
             return None
+        
         faqs = await conn.fetch("""
             SELECT f.question, f.answer
             FROM faq_data f
@@ -1355,6 +1664,7 @@ async def get_policy_details(policy_name: str, company_id: int):
             WHERE LOWER(d.doc_name) LIKE LOWER($1) AND f.company_id = $2
             ORDER BY f.id
         """, f"%{policy_name}%", company_id)
+        
         return {
             'policy': dict(policy),
             'faqs': [dict(faq) for faq in faqs]
@@ -1374,23 +1684,28 @@ async def download_policy_file(policy_name: str, session_id: str, company_id: in
             await cl.Message(content=response).send()
             await db_manager.store_message(session_id, 'assistant', response)
             return
+        
         policy_path = policy_details['doc_path']
         policy_full_name = policy_details['doc_name']
+        
         if not os.path.exists(policy_path):
             response = f"❌ File not found: {policy_full_name}\nPath: {policy_path}"
             await cl.Message(content=response).send()
             await db_manager.store_message(session_id, 'assistant', response)
             return
+        
         try:
             file_element = cl.File(
                 name=os.path.basename(policy_path),
                 path=policy_path,
                 display="inline"
             )
+            
             if is_copilot:
                 response = f"📄 {policy_full_name} - Download ready"
             else:
                 response = f"📄 Download Ready: {policy_full_name}\n\n📁 File: {os.path.basename(policy_path)}"
+            
             await cl.Message(
                 content=response,
                 elements=[file_element]
@@ -1472,6 +1787,7 @@ async def suggest_policy_actions(policy_match: Dict, user_message: str):
         policy_id = policy_match['id']
         faq_count = policy_match.get('faq_count', 0)
         company_id = cl.user_session.get("company_id")
+        
         actions = [
             cl.Action(
                 name="select_policy",
@@ -1486,11 +1802,13 @@ async def suggest_policy_actions(policy_match: Dict, user_message: str):
                 description=f"Download policy document"
             )
         ]
+        
         response = f"🎯 Detected Policy: {policy_name}\n\n📊 FAQs Available: {faq_count}\n\nQuick Actions:"
         await cl.Message(
             content=response,
             actions=actions
         ).send()
+        
         session_id = cl.user_session.get("session_id")
         conversation_history = await db_manager.get_conversation_history(session_id, limit=5)
         policy_response = await chatbot.generate_response(
@@ -1500,7 +1818,9 @@ async def suggest_policy_actions(policy_match: Dict, user_message: str):
             company_id=company_id,
             is_copilot=True
         )
+        
         await cl.Message(content=f"About {policy_name}:\n\n{policy_response}").send()
+        
         if session_id:
             await db_manager.store_message(session_id, 'assistant', response)
             await db_manager.store_message(session_id, 'assistant', f"About {policy_name}: {policy_response}")
@@ -1519,8 +1839,10 @@ async def handle_policy_selection_by_name(policy_name: str, company_id: int, is_
             response = f"❌ Policy not found: '{policy_name}'"
             await cl.Message(content=response).send()
             return
+        
         cl.user_session.set("doc_id", policy_details['id'])
         cl.user_session.set("doc_name", policy_details['doc_name'])
+        
         if is_copilot:
             response = f"✅ Selected: {policy_details['doc_name']}\n\n🎯 Ready to answer questions about this policy"
         else:
@@ -1530,6 +1852,7 @@ async def handle_policy_selection_by_name(policy_name: str, company_id: int, is_
                 f"📁 Path: {policy_details['doc_path']}\n\n"
                 f"I'll now focus my responses on this specific policy."
             )
+        
         await cl.Message(content=response).send()
         session_id = cl.user_session.get("session_id")
         if session_id:
