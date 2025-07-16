@@ -24,7 +24,6 @@
             min-height: 100vh;
         }
 
-        /* Loading Container */
         .loading-container {
             display: flex;
             flex-direction: column;
@@ -49,7 +48,6 @@
             100% { transform: rotate(360deg); }
         }
 
-        /* Auth Container */
         .auth-container {
             display: flex;
             justify-content: center;
@@ -160,7 +158,6 @@
             color: #5a67d8;
         }
 
-        /* Chat Container for Copilot */
         .chat-container {
             display: flex;
             flex-direction: column;
@@ -207,7 +204,6 @@
             background: rgba(255, 255, 255, 0.3);
         }
 
-        /* Chainlit Copilot Container */
         .copilot-container {
             flex: 1;
             position: relative;
@@ -249,8 +245,7 @@
             z-index: 1000;
         }
 
-        /* Loading/Error states */
-        .copilot-loading, .copilot-error {
+        .copilot-loading {
             display: flex;
             flex-direction: column;
             justify-content: center;
@@ -274,6 +269,17 @@
         .copilot-loading p {
             color: #6b7280;
             font-size: 14px;
+        }
+
+        .copilot-error {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+            background: #f9fafb;
+            text-align: center;
+            padding: 20px;
         }
 
         .copilot-error h3 {
@@ -300,7 +306,6 @@
             background: #5a67d8;
         }
 
-        /* Responsive Design */
         @media (max-width: 768px) {
             .chat-header {
                 padding: 16px;
@@ -611,9 +616,10 @@
             const [copilotOpen, setCopilotOpen] = useState(false);
             const { user, logout } = useContext(AuthContext);
             const copilotRef = useRef(null);
+            const token = localStorage.getItem('token');
+            const [copilotError, setCopilotError] = useState(null);
 
             useEffect(() => {
-                // Optional auto-load after 3 seconds
                 const timer = setTimeout(() => {
                     if (!copilotOpen && user) {
                         setCopilotOpen(true);
@@ -624,7 +630,31 @@
 
             const toggleCopilot = () => {
                 setCopilotOpen(!copilotOpen);
+                setCopilotError(null);
             };
+
+            // Monitor iframe load status without accessing content
+            useEffect(() => {
+                if (copilotRef.current && user && token) {
+                    copilotRef.current.src = `http://localhost:8001/copilot?token=${encodeURIComponent(token)}`;
+
+                    const handleLoad = () => {
+                        // Check load status instead of content
+                        fetch(copilotRef.current.src)
+                            .then(response => {
+                                if (!response.ok) {
+                                    setCopilotError('Failed to load Copilot. Authentication may be required.');
+                                }
+                            })
+                            .catch(() => {
+                                setCopilotError('Network error loading Copilot. Please try again.');
+                            });
+                    };
+
+                    copilotRef.current.addEventListener('load', handleLoad);
+                    return () => copilotRef.current.removeEventListener('load', handleLoad);
+                }
+            }, [copilotOpen, user, token]);
 
             return React.createElement('div', { className: 'chat-container' },
                 React.createElement('div', { className: 'chat-header' },
@@ -642,14 +672,24 @@
                         className: 'copilot-button',
                         onClick: toggleCopilot
                     }, copilotOpen ? '✕ Close' : '🤖 AI Assistant'),
-                    user && React.createElement('iframe', {
-                        ref: copilotRef,
-                        id: 'copilot-frame',
-                        className: 'copilot-iframe',
-                        src: 'http://localhost:8001/copilot', // Updated to match Chainlit port
-                        title: 'FAQ Assistant Copilot',
-                        style: { display: copilotOpen ? 'block' : 'none' }
-                    })
+                    user && (copilotError ? 
+                        React.createElement('div', { className: 'copilot-error' },
+                            React.createElement('h3', null, 'Error'),
+                            React.createElement('p', null, copilotError),
+                            React.createElement('button', {
+                                className: 'retry-button',
+                                onClick: () => {
+                                    toggleCopilot();
+                                    setTimeout(toggleCopilot, 0);
+                                }
+                            }, 'Retry')
+                        ) : React.createElement('iframe', {
+                            ref: copilotRef,
+                            id: 'copilot-frame',
+                            className: 'copilot-iframe',
+                            title: 'FAQ Assistant Copilot',
+                            style: { display: copilotOpen ? 'block' : 'none' }
+                        }))
                 )
             );
         };

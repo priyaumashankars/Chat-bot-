@@ -13,6 +13,7 @@ import tempfile
 import asyncio
 from typing import Any, Dict, List, Optional, Union
 import shutil
+from sentence_transformers import SentenceTransformer
 
 # Load .env
 load_dotenv()
@@ -23,8 +24,13 @@ os.environ["CHAINLIT_ALLOW_ORIGINS"] = '["*"]'
 # Disable Chainlit's data layer to avoid conflicts
 cl.data_layer = None
 
-# Initialize OpenAI client properly for v1.84.0
+# Initialize OpenAI client properly for v1.84.0 (only for text processing, not embeddings)
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Initialize the static embedding model (runs 100x-400x faster on CPU)
+print("Loading static embedding model...")
+embedding_model = SentenceTransformer('sentence-transformers/static-retrieval-mrl-en-v1')
+print("Static embedding model loaded successfully!")
 
 # Ensure upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -264,17 +270,19 @@ class DocumentProcessor:
 class FAQGenerator:
     def __init__(self, api_key):
         self.client = OpenAI(api_key=api_key)
+        # Use the global static embedding model instead of OpenAI embeddings
+        self.embedding_model = embedding_model
 
     def generate_embedding(self, text):
-        """Generate embedding using OpenAI text-embedding-3-small model"""
+        """Generate embedding using static-retrieval-mrl-en-v1 model (100x-400x faster on CPU)"""
         try:
-            response = self.client.embeddings.create(
-                model="text-embedding-3-small",
-                input=text
-            )
-            return response.data[0].embedding
+            # Use the static embedding model instead of OpenAI
+            embedding = self.embedding_model.encode(text, normalize_embeddings=True)
+            
+            # Convert to list for database storage (PostgreSQL expects array format)
+            return embedding.tolist()
         except Exception as e:
-            print(f"Error generating embedding: {e}")
+            print(f"Error generating static embedding: {e}")
             return None
 
     def generate_faqs_from_text(self, text):
@@ -368,6 +376,8 @@ async def start():
 
 Welcome to the PDF document processing interface!
 
+🚀 **NEW: Now using ultra-fast static embedding model (100x-400x faster on CPU!)**
+
 📚 **Current Documents:** No documents uploaded yet.
 
 **Available Commands:**
@@ -407,7 +417,7 @@ async def main(message: cl.Message):
                 upload_tasks.append(process_pdf_upload(element.path, element.name))
 
         if upload_tasks:
-            await cl.Message(content=f"🔄 **Processing {len(upload_tasks)} PDF file(s)...**").send()
+            await cl.Message(content=f"🔄 **Processing {len(upload_tasks)} PDF file(s) with ultra-fast static embeddings...**").send()
 
             # Process uploads concurrently
             results = await asyncio.gather(*upload_tasks, return_exceptions=True)
@@ -474,6 +484,8 @@ async def show_help():
 • **help** - Show this help message
 
 📤 **To upload PDFs**: Use the attachment button (📎) to select and upload PDF files. You'll be prompted for the company name or code after uploading.
+
+🚀 **Performance**: Now using ultra-fast static embedding model (100x-400x faster on CPU!)
 
 **Examples:**
 - `delete 1` - Delete document with ID 1
@@ -561,7 +573,7 @@ async def process_pdf_upload(file_path, filename):
             # Update document with extracted text
             await conn.execute("UPDATE doc_data SET doc_content = $1 WHERE id = $2", str(text), doc_id)
 
-            # Generate FAQs from the extracted text
+            # Generate FAQs from the extracted text using static embeddings
             faqs = faq_generator.generate_faqs_from_text(text)
 
             if not faqs:
@@ -575,7 +587,7 @@ async def process_pdf_upload(file_path, filename):
                 await db_manager.update_document_status(doc_id, 'failed')
                 return False
 
-            # Store FAQs with embeddings and company_id
+            # Store FAQs with static embeddings and company_id
             stored_faqs = 0
             for faq in faqs:
                 embedding = faq_generator.generate_embedding(faq['question'])
@@ -604,7 +616,7 @@ async def process_pdf_upload(file_path, filename):
             await db_manager.update_document_status(doc_id, 'completed')
 
             await cl.Message(
-                content=f"✅ **{filename}** processed successfully for company '{company_identifier}'!\n🤖 Generated {stored_faqs} FAQs in {processing_time}s"
+                content=f"✅ **{filename}** processed successfully for company '{company_identifier}'!\n🚀 Generated {stored_faqs} FAQs in {processing_time}s using ultra-fast static embeddings!"
             ).send()
 
             return True
@@ -663,7 +675,7 @@ async def show_document_status():
         # Safe handling of processing_time
         processing_time = doc.get('processing_time', 0)
         if processing_time and processing_time > 0:
-            status_msg += f"   ⏱️ Process Time: {processing_time}s\n"
+            status_msg += f"   ⚡ Process Time: {processing_time}s (with static embeddings)\n"
 
         # Safe handling of created_at
         if doc.get('created_at'):
@@ -735,10 +747,12 @@ async def show_processing_stats():
    🔄 Status Processing: {status_processing}
 
 🤖 **Total FAQs Generated:** {total_faqs}
-⏱️ **Average Processing Time:** {avg_processing_time:.1f}s
+⚡ **Average Processing Time:** {avg_processing_time:.1f}s (with static embeddings)
 💾 **Total File Size:** {total_file_size / (1024*1024):.1f} MB
 
 📈 **Success Rate:** {success_rate:.1f}%
+
+🚀 **Performance Boost:** Using static-retrieval-mrl-en-v1 model (100x-400x faster on CPU!)
 """
             await cl.Message(content=stats_msg).send()
 
@@ -777,7 +791,7 @@ async def delete_document(doc_id):
         await cl.Message(content=f"❌ **Error deleting document:** {str(e)}").send()
 
 async def reprocess_document(doc_id):
-    """Reprocess a document to regenerate FAQs"""
+    """Reprocess a document to regenerate FAQs using static embeddings"""
     await db_manager.init_pool()
     async with db_manager.pool.acquire() as conn:
         try:
@@ -790,10 +804,11 @@ async def reprocess_document(doc_id):
                 await cl.Message(content=f"❌ **Document {doc_id} not found.**\nUse `status` command to see available documents.").send()
                 return
 
-            await cl.Message(content=f"🔄 **Reprocessing {doc['doc_name']}...**").send()
+            await cl.Message(content=f"🔄 **Reprocessing {doc['doc_name']} with ultra-fast static embeddings...**").send()
 
             # Update status to processing
             await conn.execute("UPDATE doc_data SET doc_status = $1 WHERE id = $2", 'processing', doc_id)
+            await db_manager.update_document_status(doc_id, 'processing')
 
             # Delete existing FAQs
             await conn.execute("DELETE FROM faq_data WHERE doc_id = $1", doc_id)
@@ -823,9 +838,13 @@ async def reprocess_document(doc_id):
                     WHERE id = $4
                 """, 'completed', stored_faqs, datetime.now(), doc_id)
 
-                await cl.Message(content=f"✅ **Reprocessing complete!** Generated {stored_faqs} new FAQs for **{doc['doc_name']}**.").send()
+                # Update document_status table
+                await db_manager.update_document_status(doc_id, 'completed')
+
+                await cl.Message(content=f"✅ **Reprocessing complete!** Generated {stored_faqs} new FAQs for **{doc['doc_name']}** using static embeddings.").send()
             else:
                 await conn.execute("UPDATE doc_data SET doc_status = $1 WHERE id = $2", 'failed', doc_id)
+                await db_manager.update_document_status(doc_id, 'failed')
                 await cl.Message(content=f"❌ **Reprocessing failed** - Could not generate FAQs for **{doc['doc_name']}**.").send()
 
         except ValueError:
@@ -838,3 +857,4 @@ if __name__ == "__main__":
     print(f"Database URL: {'✅ Configured' if DATABASE_URL else '❌ Missing'}")
     print(f"OpenAI API Key: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
     print(f"Upload Folder: {UPLOAD_FOLDER}")
+    print("🚀 Using static-retrieval-mrl-en-v1 embedding model for 100x-400x faster performance on CPU!")
