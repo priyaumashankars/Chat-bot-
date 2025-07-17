@@ -12,7 +12,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import requests
 import hashlib
-import json  # Added to handle JSON serialization
+import json
 from sentence_transformers import SentenceTransformer
 
 # Load environment variables
@@ -48,7 +48,7 @@ async def init_auth_tables():
     """Initialize authentication tables if they don't exist"""
     conn = await get_db_connection()
     try:
-        # Create companies table (assumed to be missing)
+        # Create companies table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS companies (
                 id SERIAL PRIMARY KEY,
@@ -56,13 +56,14 @@ async def init_auth_tables():
                 code VARCHAR(255) UNIQUE NOT NULL
             )
         """)
+        
         # Create users table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
                 email VARCHAR(255) UNIQUE NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
-                company_id INTEGER,
+                company_id INTEGER REFERENCES companies(id),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 is_active BOOLEAN DEFAULT TRUE
             )
@@ -74,7 +75,7 @@ async def init_auth_tables():
                 id SERIAL PRIMARY KEY,
                 identifier VARCHAR(255) UNIQUE NOT NULL,
                 email VARCHAR(255),
-                company_id INTEGER,
+                company_id INTEGER REFERENCES companies(id),
                 metadata JSONB,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -92,27 +93,79 @@ async def init_auth_tables():
             )
         """)
         
-        print("Authentication tables initialized")
+        # Create faq_data table if it doesn't exist
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS faq_data (
+                id SERIAL PRIMARY KEY,
+                company_id INTEGER REFERENCES companies(id),
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                embedding FLOAT4[] NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create doc_data table if it doesn't exist
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS doc_data (
+                id SERIAL PRIMARY KEY,
+                company_id INTEGER REFERENCES companies(id),
+                doc_status VARCHAR(50) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Insert a default company if none exists
+        company_exists = await conn.fetchval("SELECT COUNT(*) FROM companies")
+        if company_exists == 0:
+            await conn.execute("""
+                INSERT INTO companies (name, code) VALUES 
+                ('Default Company', 'default'),
+                ('Test Company', 'test')
+            """)
+            print("✅ Default companies created")
+        
+        print("✅ Authentication tables initialized")
     finally:
         await conn.close()
 
 def generate_token(user_id, company_id):
+    """Generate JWT token with extended expiration"""
     payload = {
         'user_id': user_id,
         'company_id': company_id,
         'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24),
+        'iat': datetime.datetime.utcnow(),
         'embedding_model': 'static-retrieval-mrl-en-v1'
     }
     return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
 
 def verify_token(token):
+    """Verify JWT token"""
     try:
         payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
         return payload
     except jwt.ExpiredSignatureError:
+        print("Token expired")
         return None
-    except jwt.InvalidTokenError:
+    except jwt.InvalidTokenError as e:
+        print(f"Invalid token: {e}")
         return None
+
+# Helper function to extract token from request
+def get_token_from_request():
+    """Extract token from Authorization header or query parameter"""
+    # Try Authorization header first
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        return auth_header[7:]
+    
+    # Try query parameter (for Chainlit iframe)
+    token = request.args.get('token')
+    if token:
+        return token
+    
+    return None
 
 async def get_company_by_code(company_code):
     """Get company by code from database"""
@@ -190,8 +243,7 @@ async def create_chainlit_user(email, company_id, user_id):
             'company_name': company['name'] if company else 'Unknown',
             'company_code': company['code'] if company else 'Unknown',
             'user_id': user_id,
-            'embedding_model': 'static-retrieval-mrl-en-v1',
-            'performance': '100x-400x faster on CPU'
+            'embedding_model': 'static-retrieval-mrl-en-v1'
         }
         
         await conn.execute("""
@@ -202,25 +254,23 @@ async def create_chainlit_user(email, company_id, user_id):
                 company_id = $3,
                 metadata = $4,
                 last_login = CURRENT_TIMESTAMP
-        """, email, email, company_id, json.dumps(metadata))  # Convert dict to JSON string
+        """, email, email, company_id, json.dumps(metadata))
         
     finally:
         await conn.close()
 
 def generate_static_embedding(text):
-    """Generate embedding using static-retrieval-mrl-en-v1 model (100x-400x faster on CPU)"""
+    """Generate embedding using sentence transformer model"""
     try:
-        # Use the static embedding model instead of OpenAI
         embedding = embedding_model.encode(text, normalize_embeddings=True)
-        return embedding.tolist()  # Convert to list for compatibility
+        return embedding.tolist()
     except Exception as e:
-        print(f"Error generating static embedding: {e}")
+        print(f"Error generating embedding: {e}")
         return None
 
 async def search_faqs_by_embedding(query, company_id):
-    """Search FAQs using static embeddings and cosine similarity (ultra-fast!)"""
+    """Search FAQs using embeddings and cosine similarity"""
     try:
-        # Generate embedding for the query using static model
         query_embedding = generate_static_embedding(query)
         
         if not query_embedding:
@@ -238,12 +288,12 @@ async def search_faqs_by_embedding(query, company_id):
             if not faqs:
                 return None
             
-            # Calculate similarities using static embeddings
+            # Calculate similarities
             similarities = []
             for faq in faqs:
-                if faq['embedding']:  # Make sure embedding exists
+                if faq['embedding']:
                     try:
-                        faq_embedding = faq['embedding']
+                        faq_embedding = list(faq['embedding'])
                         similarity = cosine_similarity(
                             [query_embedding],
                             [faq_embedding]
@@ -261,7 +311,7 @@ async def search_faqs_by_embedding(query, company_id):
             best_match = similarities[0]
             
             # Return the best match if confidence is high enough
-            if best_match[0] >= 0.7:  # Minimum confidence threshold
+            if best_match[0] >= 0.6:  # Lower threshold for better matches
                 return {
                     'answer': best_match[1]['answer'],
                     'question': best_match[1]['question'],
@@ -305,7 +355,7 @@ async def search_faqs_by_keywords(query, company_id):
             return {
                 'answer': faq['answer'],
                 'question': faq['question'],
-                'confidence': 0.8,  # Default confidence for keyword search
+                'confidence': 0.7,
                 'source': 'faq',
                 'embedding_type': 'keyword_fallback'
             }
@@ -325,10 +375,10 @@ def signup():
                 
             email = data.get('email')
             password = data.get('password')
-            company_code = data.get('company_code')
+            company_code = data.get('company_code', 'default')  # Default fallback
             
-            if not email or not password or not company_code:
-                return jsonify({'error': 'Email, password, and company code are required'}), 400
+            if not email or not password:
+                return jsonify({'error': 'Email and password are required'}), 400
             
             # Check if company exists
             company = await get_company_by_code(company_code)
@@ -360,6 +410,7 @@ def signup():
                     'company_id': company['id']
                 },
                 'embedding_model': 'static-retrieval-mrl-en-v1',
+                'performance': '100x-400x faster on CPU',
                 'chainlit_url': f"{CHAINLIT_SERVER_URL}?token={token}"
             })
             
@@ -420,12 +471,9 @@ def login():
 @app.route('/api/verify-token', methods=['GET'])
 def verify_token_route():
     try:
-        token = request.headers.get('Authorization')
+        token = get_token_from_request()
         if not token:
             return jsonify({'error': 'Token is missing'}), 401
-        
-        if token.startswith('Bearer '):
-            token = token[7:]
             
         payload = verify_token(token)
         if not payload:
@@ -444,19 +492,13 @@ def verify_token_route():
         print(f"Token verification error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
-# New endpoint for Chainlit authentication using query parameter
-@app.route('/api/chainlit-auth', methods=['GET'])
-def chainlit_auth_get():
+# Enhanced endpoint for Chainlit authentication
+@app.route('/api/chainlit-auth', methods=['GET', 'POST'])
+def chainlit_auth():
     async def async_chainlit_auth():
         try:
-            # Get token from query parameter (for iframe URLs)
-            token = request.args.get('token')
-            
-            if not token:
-                # Try Authorization header as fallback
-                auth_header = request.headers.get('Authorization')
-                if auth_header and auth_header.startswith('Bearer '):
-                    token = auth_header[7:]
+            # Get token from query parameter or Authorization header
+            token = get_token_from_request()
             
             if not token:
                 return jsonify({'error': 'Access token is required'}), 400
@@ -474,7 +516,9 @@ def chainlit_auth_get():
             return jsonify({
                 'authenticated': True,
                 'user': user_info,
-                'embedding_model': 'static-retrieval-mrl-en-v1'
+                'embedding_model': 'static-retrieval-mrl-en-v1',
+                'performance': '100x-400x faster on CPU',
+                'token': token  # Return token for Chainlit to use
             })
             
         except Exception as e:
@@ -487,12 +531,9 @@ def chainlit_auth_get():
 def search():
     async def async_search():
         try:
-            token = request.headers.get('Authorization')
+            token = get_token_from_request()
             if not token:
                 return jsonify({'error': 'Token is missing'}), 401
-            
-            if token.startswith('Bearer '):
-                token = token[7:]
                 
             payload = verify_token(token)
             if not payload:
@@ -506,7 +547,7 @@ def search():
             if not query:
                 return jsonify({'error': 'Query is required'}), 400
             
-            # Try static embedding-based search first (ultra-fast!)
+            # Try embedding-based search first
             result = await search_faqs_by_embedding(query, payload['company_id'])
             
             # Fallback to keyword search if embedding search fails
@@ -534,12 +575,9 @@ def search():
 def company_stats():
     async def async_stats():
         try:
-            token = request.headers.get('Authorization')
+            token = get_token_from_request()
             if not token:
                 return jsonify({'error': 'Token is missing'}), 401
-            
-            if token.startswith('Bearer '):
-                token = token[7:]
                 
             payload = verify_token(token)
             if not payload:
@@ -567,8 +605,7 @@ def company_stats():
                         'total_documents': stats['total_documents'] or 0,
                         'total_faqs': stats['total_faqs'] or 0,
                         'completed_documents': stats['completed_documents'] or 0,
-                        'embedding_model': 'static-retrieval-mrl-en-v1',
-                        'performance': '100x-400x faster on CPU'
+                        'embedding_model': 'static-retrieval-mrl-en-v1'
                     })
                 else:
                     return jsonify({
@@ -606,6 +643,25 @@ def embedding_info():
         'status': 'loaded'
     })
 
+# Add a test route for debugging
+@app.route('/api/test-auth', methods=['GET'])
+def test_auth():
+    async def async_test_auth():
+        try:
+            token = get_token_from_request()
+            if not token:
+                return jsonify({'error': 'No token provided', 'headers': dict(request.headers), 'args': dict(request.args)}), 401
+            
+            payload = verify_token(token)
+            if not payload:
+                return jsonify({'error': 'Invalid token', 'token': token[:20] + '...'}), 401
+            
+            return jsonify({'success': True, 'payload': payload})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    return asyncio.run(async_test_auth())
+
 # Serve the HTML file
 @app.route('/')
 def serve_html():
@@ -624,15 +680,12 @@ if __name__ == '__main__':
         print(f"❌ Database initialization error: {e}")
         print("Please check your DATABASE_URL in .env file")
     
-    print("🚀 Flask server starting with ultra-fast static embeddings...")
+    print("🚀 Flask server starting...")
     print(f"📍 Access the app at: http://localhost:5000")
     print(f"🗄️ Database: {'✅ Connected' if DATABASE_URL else '❌ Missing DATABASE_URL'}")
     print(f"🤖 OpenAI: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing OPENAI_API_KEY'}")
     print(f"⚡ Embedding Model: static-retrieval-mrl-en-v1 (100x-400x faster on CPU!)")
     print(f"🔗 Chainlit: {CHAINLIT_SERVER_URL}")
-    print("📝 Make sure you have companies and FAQs in your database!")
-    print("🤖 Start Chainlit copilot with: chainlit run copilot_faq.py")
-    print("💡 All FAQ searches now use ultra-fast static embeddings!")
-    print("🔐 Chainlit authentication integrated with Flask users!")
+    print("🔐 Authentication system ready!")
     
     app.run(debug=True, port=5000, host='0.0.0.0')

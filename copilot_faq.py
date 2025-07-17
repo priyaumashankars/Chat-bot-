@@ -11,10 +11,13 @@ from openai import OpenAI
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
-from typing import Optional
+from typing import Optional, Union
 import asyncio
 from sentence_transformers import SentenceTransformer
 from datetime import datetime, timedelta
+import traceback
+import requests
+from urllib.parse import urlparse, parse_qs
 
 # Load environment variables
 load_dotenv()
@@ -22,6 +25,7 @@ load_dotenv()
 DATABASE_URL = os.getenv('DATABASE_URL')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-this')
+FLASK_SERVER_URL = os.getenv('FLASK_SERVER_URL', 'http://localhost:5000')
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -32,7 +36,7 @@ security = HTTPBearer()
 # Add CORS middleware for frontend compatibility
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust to specific origins if needed, e.g., ["http://localhost:3000"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,14 +87,68 @@ def create_access_token(data: dict) -> str:
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=ALGORITHM)
 
-# FastAPI Login endpoint
+# Utility function to ensure string conversion
+def ensure_string(value: Union[str, list, None]) -> str:
+    """Ensure value is converted to string, handling lists and None values"""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    return str(value)
+
+# Thread logging with proper error handling
+async def log_thread_update(user_id: int, thread_id: str, message_type: str, content: str, metadata: dict = None):
+    """Log thread updates with proper error handling"""
+    try:
+        if not DATABASE_URL:
+            return
+        
+        conn = await get_db_connection()
+        try:
+            # Create table if it doesn't exist
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS thread_logs (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    thread_id VARCHAR(255) NOT NULL,
+                    message_type VARCHAR(50) NOT NULL,
+                    content TEXT,
+                    metadata JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Ensure all parameters are properly formatted
+            safe_message_type = ensure_string(message_type)
+            safe_content = ensure_string(content)
+            safe_metadata = metadata or {}
+            
+            await conn.execute(
+                """
+                INSERT INTO thread_logs (user_id, thread_id, message_type, content, metadata, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                user_id,
+                thread_id,
+                safe_message_type,
+                safe_content,
+                safe_metadata,
+                datetime.utcnow()
+            )
+        finally:
+            await conn.close()
+    except Exception as e:
+        print(f"Error logging thread update: {e}")
+
+# FastAPI endpoints (keeping existing ones)
 @app.post("/api/login")
 async def login(request: LoginRequest):
     conn = await get_db_connection()
     try:
         user = await conn.fetchrow(
             """
-            SELECT u.id, u.email, u.password, u.company_id, c.name as company_name, c.code as company_code
+            SELECT u.id, u.email, u.password_hash, u.company_id, c.name as company_name, c.code as company_code
             FROM users u
             JOIN companies c ON u.company_id = c.id
             WHERE u.email = $1 AND u.is_active = true
@@ -100,7 +158,7 @@ async def login(request: LoginRequest):
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
-        if not verify_password(request.password, user["password"]):
+        if not verify_password(request.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
         token = create_access_token({"sub": user["id"], "email": user["email"]})
@@ -118,7 +176,6 @@ async def login(request: LoginRequest):
     finally:
         await conn.close()
 
-# FastAPI Signup endpoint
 @app.post("/api/signup")
 async def signup(request: SignupRequest):
     conn = await get_db_connection()
@@ -141,7 +198,7 @@ async def signup(request: SignupRequest):
 
         user = await conn.fetchrow(
             """
-            INSERT INTO users (email, password, company_id, is_active)
+            INSERT INTO users (email, password_hash, company_id, is_active)
             VALUES ($1, $2, $3, true)
             RETURNING id, email, company_id
             """,
@@ -163,7 +220,6 @@ async def signup(request: SignupRequest):
     finally:
         await conn.close()
 
-# FastAPI Token verification endpoint
 @app.get("/api/verify-token")
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -203,15 +259,66 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# Chainlit backend logic
-def verify_token(token: str) -> Optional[dict]:
-    """Verify JWT token and return payload"""
+# Enhanced token verification for Chainlit
+def verify_token_chainlit(token: str) -> Optional[dict]:
+    """Verify JWT token using Flask backend"""
     try:
+        # First try local verification
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=['HS256'])
         return payload
     except jwt.ExpiredSignatureError:
+        print("Token expired")
         return None
     except jwt.InvalidTokenError:
+        print("Invalid token")
+        return None
+
+def get_token_from_chainlit_context():
+    """Extract token from Chainlit context (URL parameters or environment)"""
+    try:
+        # Check if token is stored in session first
+        token = cl.user_session.get("token")
+        if token:
+            return token
+        
+        # Check environment variable (for testing)
+        env_token = os.getenv("CHAINLIT_TOKEN")
+        if env_token:
+            return env_token
+            
+        # Try to get from query string if available
+        # This is a workaround since Chainlit doesn't expose URL params directly
+        # The token should be passed when launching Chainlit
+        try:
+            # Check if there's a way to access request context
+            import chainlit.context as ctx
+            if hasattr(ctx, 'context') and ctx.context:
+                # Try to get token from context if available
+                context_token = getattr(ctx.context, 'token', None)
+                if context_token:
+                    return context_token
+        except:
+            pass
+            
+        return None
+    except Exception as e:
+        print(f"Error getting token from context: {e}")
+        return None
+
+async def authenticate_with_flask(token: str) -> Optional[dict]:
+    """Authenticate token with Flask backend"""
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(f"{FLASK_SERVER_URL}/api/chainlit-auth", 
+                              headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Flask authentication failed: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error authenticating with Flask: {e}")
         return None
 
 async def get_user_info(user_id: int) -> Optional[dict]:
@@ -331,72 +438,160 @@ async def search_faqs_by_keywords(query: str, company_id: int) -> Optional[dict]
     finally:
         await conn.close()
 
+# Note: @cl.auth_callback is not available in this version of Chainlit
+# We'll handle authentication manually in the chat start function
+
 @cl.on_chat_start
 async def start():
-    """Initialize chat session"""
+    """Initialize chat session with authentication"""
     try:
+        # Get token from various sources
+        token = get_token_from_chainlit_context()
+        
+        # Alternative: Try to get token from environment or pre-set session
+        if not token:
+            # Check if token was passed via environment for testing
+            token = os.getenv("CHAINLIT_TOKEN")
+        
+        if not token:
+            await cl.Message(
+                content="""❌ **Authentication Required**
+
+Please access this chat through your authenticated dashboard.
+
+**For Testing:** Set the CHAINLIT_TOKEN environment variable:
+```bash
+export CHAINLIT_TOKEN="your_jwt_token_here"
+chainlit run copilot_faq.py --port 8001
+```
+
+If you're seeing this message, it means:
+1. You accessed Chainlit directly without authentication
+2. Your session has expired
+3. The token is missing from the URL or environment
+
+**To continue:** Please log in through your main application and access the chat from there.
+""",
+            ).send()
+            return
+
+        # Store token in session for future use
+        cl.user_session.set("token", token)
+
+        # Verify token with Flask backend
+        auth_response = await authenticate_with_flask(token)
+        
+        if not auth_response or not auth_response.get("authenticated"):
+            await cl.Message(
+                content=f"""❌ **Authentication Failed**
+
+Your authentication token is invalid or expired.
+
+**Debug Info:**
+- Token present: {'✅' if token else '❌'}
+- Token length: {len(token) if token else 0}
+- Flask server: {FLASK_SERVER_URL}
+- Auth response: {auth_response}
+
+**To continue:** Please log in again through your main application.
+""",
+            ).send()
+            return
+
+        user_info = auth_response.get("user")
+        if not user_info:
+            await cl.Message(
+                content="""❌ **User Information Missing**
+
+Could not retrieve your user information.
+
+**To continue:** Please contact support or try logging in again.
+""",
+            ).send()
+            return
+
+        # Store user info in session
+        cl.user_session.set("authenticated", True)
+        cl.user_session.set("user", user_info)
+        
+        company_name = user_info.get('company_name', 'Unknown Company')
+        user_email = user_info.get('email', 'Unknown User')
+        
         await cl.Message(
             content=f"""🎉 **Welcome to your Ultra-Fast FAQ Assistant!**
 
-I'm here to help you find answers from the documents using cutting-edge static embeddings.
+**Hello, {user_email}!**  
+**Company:** {company_name}
+
+I'm here to help you find answers from your company's documents using cutting-edge static embeddings.
 
 🚀 **Powered by:** static-retrieval-mrl-en-v1 model (100x-400x faster on CPU!)
 
 💡 **Just ask me anything about your company's policies, products, or processes!**
+
+**Authentication Status:** ✅ Verified  
+**Database:** {'✅ Connected' if DATABASE_URL else '❌ Not configured'}
+
+**System Status:**
+- Flask Backend: {'✅ Connected' if FLASK_SERVER_URL else '❌ Not configured'}
+- User ID: {user_info.get('id')}
+- Company ID: {user_info.get('company_id')}
 """,
         ).send()
-        cl.user_session.set("authenticated", False)
-        cl.user_session.set("user", None)
+        
+        # Log chat start
+        try:
+            await log_thread_update(
+                user_id=int(user_info.get('id')),
+                thread_id="chat_start",
+                message_type="system",
+                content="Chat session started",
+                metadata={"company_id": user_info.get('company_id')}
+            )
+        except Exception as log_error:
+            print(f"Chat start logging error: {log_error}")
+            
     except Exception as e:
         print(f"Chat start error: {e}")
+        print(f"Chat start error traceback: {traceback.format_exc()}")
         await cl.Message(
-            content="❌ **Initialization Error**\n\nThere was an issue starting the FAQ assistant.",
+            content=f"""❌ **Initialization Error**
+
+There was an issue starting the FAQ assistant.
+
+**Error:** {str(e)}
+
+**Debug Info:**
+- Database URL: {'✅ Set' if DATABASE_URL else '❌ Missing'}
+- Flask Server: {FLASK_SERVER_URL}
+- Token: {'✅ Present' if get_token_from_chainlit_context() else '❌ Missing'}
+
+Please try refreshing the page or contact support.
+""",
         ).send()
 
 @cl.on_message
 async def main(message: cl.Message):
     """Handle incoming messages and provide FAQ responses"""
     try:
-        query = message.content.strip()
-        token = cl.query_params.get('token', [None])[0]
-        authenticated = False
-        user = None
-
-        if token:
-            payload = verify_token(token)
-            if payload:
-                user_id = payload.get('sub')
-                if user_id:
-                    user_info = await get_user_info(int(user_id))
-                    if user_info:
-                        authenticated = True
-                        user = user_info
-                        cl.user_session.set("authenticated", True)
-                        cl.user_session.set("user", user_info)
-                    else:
-                        await cl.get_ui().send_message({"type": "custom", "data": "auth_required"}, parent=True)
-                else:
-                    await cl.get_ui().send_message({"type": "custom", "data": "auth_required"}, parent=True)
-            else:
-                await cl.get_ui().send_message({"type": "custom", "data": "auth_required"}, parent=True)
-        else:
-            await cl.get_ui().send_message({"type": "custom", "data": "auth_required"}, parent=True)
-
-        if not authenticated:
+        # Check if user is authenticated
+        if not cl.user_session.get("authenticated"):
             await cl.Message(
-                content="❌ **Authentication Required**\n\nPlease login to access the FAQ assistant.",
+                content="❌ **Authentication Required**\n\nPlease restart the chat and ensure you're properly authenticated.",
             ).send()
             return
 
         user = cl.user_session.get("user")
         if not user:
             await cl.Message(
-                content="❌ **User Not Found**\n\nYour user account could not be found in the database. Please contact support.",
+                content="❌ **Session Expired**\n\nPlease refresh the page and log in again.",
             ).send()
             return
 
+        query = message.content.strip()
         company_id = user.get('company_id')
         company_name = user.get('company_name', 'Unknown Company')
+        user_id = user.get('id')
 
         if not company_id:
             await cl.Message(
@@ -410,9 +605,11 @@ async def main(message: cl.Message):
             ).send()
             return
 
+        # Show processing message
         processing_msg = cl.Message(content="🚀 Searching with ultra-fast static embeddings...")
         await processing_msg.send()
 
+        # Search for FAQ answers
         result = None
         if DATABASE_URL:
             result = await search_faqs_by_embedding(query, company_id)
@@ -420,6 +617,7 @@ async def main(message: cl.Message):
         if not result and DATABASE_URL:
             result = await search_faqs_by_keywords(query, company_id)
 
+        # Remove processing message
         await processing_msg.remove()
 
         if result:
@@ -441,13 +639,29 @@ async def main(message: cl.Message):
 
             if result['confidence'] < 0.7:
                 response += "\n\n💡 **Tip:** Try rephrasing your question or using different keywords for better results."
+                
+            # Log successful response
+            try:
+                await log_thread_update(
+                    user_id=int(user_id),
+                    thread_id=cl.user_session.get("id", "default"),
+                    message_type="assistant_response",
+                    content=response,
+                    metadata={
+                        "query": query,
+                        "confidence": result['confidence'],
+                        "embedding_type": result.get('embedding_type')
+                    }
+                )
+            except Exception as log_error:
+                print(f"Response logging error: {log_error}")
         else:
             response = f"""❓ **No specific information found**
 
 I couldn't find relevant information for your question in {company_name}'s documents.
 
 **🔍 Try these suggestions:**
-• Rephrase your question using different keywords
+• Rephrase your question using different keywords  
 • Break complex questions into simpler parts  
 • Check if the topic is covered in your company's uploaded documents
 
@@ -464,10 +678,12 @@ If this is a fresh installation, please make sure:
 3. Documents are processed with the new static embedding model"""
 
         await cl.Message(content=response).send()
+
     except Exception as e:
         print(f"Message handling error: {e}")
+        print(f"Message handling error traceback: {traceback.format_exc()}")
         await cl.Message(
-            content=f"❌ **Sorry, there was an error processing your request.**\n\nError details: {str(e)}\n\nPlease try again or contact support if the issue persists.",
+            content=f"❌ **Sorry, there was an error processing your request.**\n\nError details: `{str(e)}`\n\nPlease try again or contact support if the issue persists.",
         ).send()
 
 @cl.set_starters
@@ -523,7 +739,8 @@ if __name__ == "__main__":
     print(f"🗄️ Database: {'✅ Connected' if DATABASE_URL else '❌ Missing DATABASE_URL'}")
     print(f"🤖 OpenAI: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing OPENAI_API_KEY'}")
     print(f"⚡ Embedding Model: static-retrieval-mrl-en-v1 (100x-400x faster on CPU!)")
+    print(f"🔗 Flask Backend: {FLASK_SERVER_URL}")
     print("🌐 CORS enabled for iframe embedding")
     print("💡 All FAQ searches now use ultra-fast static embeddings!")
-    print("📝 Users can now chat directly with the FAQ system at lightning speed!")
+    print("🔐 Authentication integrated with Flask backend!")
     uvicorn.run(app, host="0.0.0.0", port=5000)
