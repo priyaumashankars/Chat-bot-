@@ -636,7 +636,7 @@
             // Monitor iframe load status without accessing content
             useEffect(() => {
                 if (copilotRef.current && user && token) {
-                    copilotRef.current.src = `http://localhost:8001/copilot?token=${encodeURIComponent(token)}`;
+                    copilotRef.current.src = `http://localhost:8000/copilot?token=${encodeURIComponent(token)}`;
 
                     const handleLoad = () => {
                         // Check load status instead of content
