@@ -25,6 +25,42 @@ from chainlit.input_widget import Select
 # Load environment variables
 load_dotenv()
 
+# CRITICAL: Disable Chainlit's data layer to prevent database conflicts
+os.environ["CHAINLIT_DATA_PERSISTENCE"] = "false"
+os.environ["CHAINLIT_DISABLE_DATA_LAYER"] = "true"
+
+# Disable Chainlit's built-in data persistence completely
+cl.data_layer = None
+
+# Create a no-op data layer to prevent errors
+class NoOpDataLayer:
+    async def create_thread(self, *args, **kwargs):
+        return {"id": str(uuid.uuid4())}
+    
+    async def update_thread(self, *args, **kwargs):
+        pass
+    
+    async def delete_thread(self, *args, **kwargs):
+        pass
+    
+    async def list_threads(self, *args, **kwargs):
+        return []
+    
+    async def get_thread(self, *args, **kwargs):
+        return None
+    
+    async def create_step(self, *args, **kwargs):
+        pass
+    
+    async def update_step(self, *args, **kwargs):
+        pass
+    
+    async def delete_step(self, *args, **kwargs):
+        pass
+
+# Set the no-op data layer
+cl.data_layer = NoOpDataLayer()
+
 DATABASE_URL = os.getenv('DATABASE_URL')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-this')
@@ -104,9 +140,8 @@ class LegacyLoginRequest(BaseModel):
     password: str
     metadata: Optional[dict] = None
 
-# Database connection
 async def get_db_connection():
-    """Get database connection"""
+    """Get database connection with proper error handling"""
     global connection_pool
     if connection_pool is None:
         await init_connection_pool()
@@ -116,8 +151,9 @@ async def get_db_connection():
     except asyncio.TimeoutError:
         raise HTTPException(status_code=503, detail="Database connection timeout")
     except Exception as e:
+        print(f"Database connection error: {e}")
         raise HTTPException(status_code=503, detail=f"Database connection error: {str(e)}")
-
+    
 async def init_connection_pool():
     global connection_pool
     if connection_pool is None:
@@ -324,20 +360,36 @@ async def authenticate_with_flask(token: str) -> Optional[dict]:
         # First try local verification
         payload = verify_token_chainlit(token)
         if payload:
-            user_email = payload.get("sub")
-            if user_email:
-                # Get user info from database
+            user_email = payload.get("email") or payload.get("sub")
+            user_id = payload.get("user_id") or payload.get("sub")
+            
+            if user_email or user_id:
+                # Get user info from database - use 'users' table to match main.py
                 conn = await get_db_connection()
                 try:
-                    user = await conn.fetchrow(
-                        """
-                        SELECT u.id, u.email, u.company_id, c.name as company_name, c.code as company_code
-                        FROM "User" u  -- Changed from users to "User"
-                        LEFT JOIN companies c ON u.company_id = c.id
-                        WHERE u.email = $1 AND u.is_active = true
-                        """,
-                        user_email
-                    )
+                    if user_email and '@' in str(user_email):
+                        # Search by email
+                        user = await conn.fetchrow(
+                            """
+                            SELECT u.id, u.email, u.company_id, c.name as company_name, c.code as company_code
+                            FROM users u
+                            LEFT JOIN companies c ON u.company_id = c.id
+                            WHERE u.email = $1 AND u.is_active = true
+                            """,
+                            user_email
+                        )
+                    else:
+                        # Search by ID
+                        user = await conn.fetchrow(
+                            """
+                            SELECT u.id, u.email, u.company_id, c.name as company_name, c.code as company_code
+                            FROM users u
+                            LEFT JOIN companies c ON u.company_id = c.id
+                            WHERE u.id = $1 AND u.is_active = true
+                            """,
+                            user_id
+                        )
+                    
                     if user:
                         return {
                             "authenticated": True,
@@ -382,7 +434,68 @@ def header_auth_callback(headers: Dict) -> Optional[cl.User]:
         print("Invalid authorization header format")
         return None
     
-    return validate_jwt_token(token)
+    # Validate token and get FRESH user info
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=['HS256'])
+        
+        # Get user info from token payload
+        user_id = payload.get('sub') or payload.get('user_id')
+        user_email = payload.get('email')
+        company_id = payload.get('company_id')
+        
+        if not user_id:
+            print("No user ID in token")
+            return None
+        
+        # If no email in token, fetch from database
+        if not user_email:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                async def get_user_email():
+                    conn = await get_db_connection()
+                    try:
+                        user = await conn.fetchrow(
+                            "SELECT email FROM users WHERE id = $1 AND is_active = true",
+                            int(user_id)
+                        )
+                        return user['email'] if user else None
+                    finally:
+                        if connection_pool and conn:
+                            await connection_pool.release(conn)
+                
+                user_email = loop.run_until_complete(get_user_email())
+                loop.close()
+            except Exception as e:
+                print(f"Error fetching user email: {e}")
+                user_email = f"user_{user_id}"
+        
+        # Create user with CURRENT information
+        user = cl.User(
+            identifier=user_email or str(user_id),
+            metadata={
+                "user_id": user_id,
+                "email": user_email,
+                "company_id": company_id,
+                "role": payload.get('role', 'user'),
+                "authenticated_at": datetime.utcnow().isoformat(),
+                "token_validated_locally": True,
+                "embedding_model": "static-retrieval-mrl-en-v1",
+                "performance": "100x-400x faster on CPU"
+            }
+        )
+        
+        print(f"✅ User authenticated via header: {user_email} (ID: {user_id})")
+        return user
+        
+    except jwt.ExpiredSignatureError:
+        print("JWT token has expired")
+        return None
+    except jwt.InvalidTokenError as e:
+        print(f"Invalid JWT token: {e}")
+        return None
 
 # FastAPI authentication endpoints
 @app.post("/api/login")
@@ -393,7 +506,7 @@ async def login(request: LoginRequest):
         user = await conn.fetchrow(
             """
             SELECT u.id, u.email, u.password_hash, u.company_id, c.name as company_name, c.code as company_code
-            FROM "User" u  -- Changed from users to "User"
+            FROM users u
             LEFT JOIN companies c ON u.company_id = c.id
             WHERE u.email = $1 AND u.is_active = true
             """,
@@ -405,7 +518,14 @@ async def login(request: LoginRequest):
         if not verify_password(request.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
-        token = create_access_token({"sub": user["id"], "email": user["email"]})
+        # Create token with email included
+        token_data = {
+            "sub": user["id"], 
+            "email": user["email"],
+            "user_id": user["id"],
+            "company_id": user["company_id"]
+        }
+        token = create_access_token(token_data)
 
         return {
             "token": token,
@@ -434,7 +554,7 @@ async def signup(request: SignupRequest):
             raise HTTPException(status_code=400, detail="Invalid company code")
 
         existing_user = await conn.fetchrow(
-            "SELECT id FROM \"User\" WHERE email = $1",  
+            "SELECT id FROM users WHERE email = $1",  # Use 'users' table
             request.email
         )
         if existing_user:
@@ -444,14 +564,21 @@ async def signup(request: SignupRequest):
 
         user = await conn.fetchrow(
             """
-            INSERT INTO "User" (email, password_hash, company_id, is_active) 
+            INSERT INTO users (email, password_hash, company_id, is_active) 
             VALUES ($1, $2, $3, true)
             RETURNING id, email, company_id
             """,
             request.email, hashed_password, company["id"]
         )
 
-        token = create_access_token({"sub": user["id"], "email": user["email"]})
+        # Create token with email included
+        token_data = {
+            "sub": user["id"], 
+            "email": user["email"],
+            "user_id": user["id"],
+            "company_id": user["company_id"]
+        }
+        token = create_access_token(token_data)
 
         return {
             "token": token,
@@ -473,7 +600,7 @@ async def verify_token_endpoint(credentials: HTTPAuthorizationCredentials = Depe
     try:
         token = credentials.credentials
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
+        user_id = payload.get("sub") or payload.get("user_id")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -481,7 +608,7 @@ async def verify_token_endpoint(credentials: HTTPAuthorizationCredentials = Depe
         user = await conn.fetchrow(
             """
             SELECT u.id, u.email, u.company_id, c.name as company_name, c.code as company_code
-            FROM "User" u  -- Changed from users to "User"
+            FROM users u
             LEFT JOIN companies c ON u.company_id = c.id
             WHERE u.id = $1 AND u.is_active = true
             """,
@@ -510,12 +637,18 @@ async def verify_token_endpoint(credentials: HTTPAuthorizationCredentials = Depe
 async def search_faqs_by_embedding(query: str, company_id: int) -> Optional[dict]:
     """Search FAQs using static embeddings and cosine similarity"""
     try:
+        if not company_id:
+            print("No company_id provided for FAQ search")
+            return None
+            
         query_embedding = generate_static_embedding(query)
         if not query_embedding:
+            print("Failed to generate embedding for query")
             return None
 
         conn = await get_db_connection()
         try:
+            # Fix: Use proper column names (all lowercase in PostgreSQL)
             faqs = await conn.fetch(
                 """
                 SELECT question, answer, embedding
@@ -524,8 +657,16 @@ async def search_faqs_by_embedding(query: str, company_id: int) -> Optional[dict
                 """,
                 company_id
             )
+            
+            print(f"📊 Found {len(faqs)} FAQs for company {company_id}")
+            
             if not faqs:
-                return None
+                return {
+                    'answer': "I don't have any FAQs available for your company yet. Please contact your administrator to upload some documents.",
+                    'confidence': 0.0,
+                    'source': 'system',
+                    'embedding_type': 'static-retrieval-mrl-en-v1'
+                }
 
             similarities = []
             for faq in faqs:
@@ -543,7 +684,12 @@ async def search_faqs_by_embedding(query: str, company_id: int) -> Optional[dict
                         continue
 
             if not similarities:
-                return None
+                return {
+                    'answer': "I couldn't process the available FAQs. Please try a different question.",
+                    'confidence': 0.0,
+                    'source': 'system',
+                    'embedding_type': 'static-retrieval-mrl-en-v1'
+                }
 
             similarities.sort(key=lambda x: x[0], reverse=True)
             best_match = similarities[0]
@@ -558,7 +704,7 @@ async def search_faqs_by_embedding(query: str, company_id: int) -> Optional[dict
                 }
             else:
                 return {
-                    'answer': "I couldn't find a specific answer to your question. Please try rephrasing or contact support for more help.",
+                    'answer': f"I found some related information, but I'm not confident enough (confidence: {best_match[0]:.1%}). Could you try rephrasing your question or be more specific?",
                     'confidence': float(best_match[0]),
                     'source': 'system',
                     'embedding_type': 'static-retrieval-mrl-en-v1'
@@ -566,9 +712,17 @@ async def search_faqs_by_embedding(query: str, company_id: int) -> Optional[dict
         finally:
             if connection_pool and conn:
                 await connection_pool.release(conn)
+                
     except Exception as e:
         print(f"FAQ search error: {e}")
-        return None
+        import traceback
+        traceback.print_exc()
+        return {
+            'answer': f"I encountered an error while searching. Please try again. Error: {str(e)}",
+            'confidence': 0.0,
+            'source': 'error',
+            'embedding_type': 'static-retrieval-mrl-en-v1'
+        }
 
 class DatabaseManager:
     def __init__(self):
@@ -589,9 +743,9 @@ class DatabaseManager:
                 )
             """)
             
-            # Create users table (changed to "User")
+            # Create users table (use 'users' consistently)
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS "User" (
+                CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     identifier VARCHAR(255) UNIQUE,
                     email VARCHAR(255) UNIQUE,
@@ -663,7 +817,7 @@ class DatabaseManager:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_company_id ON faq_data(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_company_id ON doc_data(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_company_id ON chat_sessions(company_id)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON \"User\"(email)") 
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)") 
             
             # Insert demo data
             company_exists = await conn.fetchval("SELECT COUNT(*) FROM companies")
@@ -757,13 +911,18 @@ def auth_callback(username: str, password: str):
             token = data.get('token')
             user_info = data.get('user', {})
             
+            # Create user with CURRENT login information
             return cl.User(
-                identifier=user_info.get('email', username),
+                identifier=user_info.get('email', username),  # Use current email
                 metadata={
                     "id": user_info.get('id'),
-                    "email": user_info.get('email'),
+                    "email": user_info.get('email', username),  # Store current email
                     "company_id": user_info.get('company_id'),
-                    "token": token
+                    "company_name": user_info.get('company_name'),
+                    "company_code": user_info.get('company_code'),
+                    "token": token,
+                    "authenticated_at": datetime.utcnow().isoformat(),
+                    "embedding_model": "static-retrieval-mrl-en-v1"
                 }
             )
         else:
@@ -781,33 +940,70 @@ async def start():
         await init_connection_pool()
         await db_manager.init_database()
         
-        # Get the authenticated user
-        user = cl.user_session.get("user")
+        # Get the authenticated user from Chainlit's user session
+        current_user = cl.user_session.get("user")
         
-        if not user:
+        if not current_user:
             await cl.Message(
                 content="❌ **Authentication Error**: No user found. Please refresh and try again."
             ).send()
             return
         
-        # Get user metadata
-        user_metadata = user.metadata
-        user_email = user_metadata.get('email', 'Unknown User')
+        # Extract CURRENT user information
+        user_identifier = current_user.identifier if hasattr(current_user, 'identifier') else None
+        user_metadata = current_user.metadata if hasattr(current_user, 'metadata') else {}
+        
+        # Use the email from metadata (which should be current)
+        user_email = user_metadata.get('email') or user_identifier
         company_id = user_metadata.get('company_id')
+        
+        # Verify this is actually the current user by checking database
+        if user_email and company_id:
+            conn = await get_db_connection()
+            try:
+                # Verify user exists and is active
+                db_user = await conn.fetchrow(
+                    """
+                    SELECT u.id, u.email, u.company_id, c.name as company_name
+                    FROM users u
+                    LEFT JOIN companies c ON u.company_id = c.id
+                    WHERE u.email = $1 AND u.company_id = $2 AND u.is_active = true
+                    """,
+                    user_email, company_id
+                )
+                
+                if db_user:
+                    # Update session with verified info
+                    user_email = db_user['email']  # Use DB email as source of truth
+                    company_name = db_user['company_name']
+                else:
+                    print(f"⚠️ User not found in DB: {user_email}, company: {company_id}")
+                    
+            finally:
+                if connection_pool and conn:
+                    await connection_pool.release(conn)
         
         # Store user info in session
         cl.user_session.set("authenticated", True)
-        cl.user_session.set("user_info", user_metadata)
+        cl.user_session.set("user_email", user_email)
         cl.user_session.set("company_id", company_id)
+        cl.user_session.set("user_metadata", user_metadata)
         
         session_id = str(uuid.uuid4())
         cl.user_session.set("session_id", session_id)
+        
+        # Debug logging
+        print(f"🔍 Chat Start - Current User:")
+        print(f"   Email: {user_email}")
+        print(f"   Company ID: {company_id}")
+        print(f"   Identifier: {user_identifier}")
         
         welcome_message = f"""🎉 **Welcome to FAQ & Policy Assistant!**
 
 👋 **Hello, {user_email}!**
 🔐 **Authentication:** ✅ Verified
 ⚡ **Engine:** static-retrieval-mrl-en-v1 (Ultra-fast CPU embeddings)
+🏢 **Company ID:** {company_id or 'Not set'}
 
 💬 **How can I help you today?**"""
         
@@ -815,6 +1011,8 @@ async def start():
         
     except Exception as e:
         print(f"Chat start error: {e}")
+        import traceback
+        traceback.print_exc()
         await cl.Message(
             content=f"❌ **Initialization Error**: {str(e)}"
         ).send()
@@ -833,6 +1031,9 @@ async def main(message: cl.Message):
         query = message.content.strip()
         company_id = cl.user_session.get("company_id")
         session_id = cl.user_session.get("session_id")
+        user_email = cl.user_session.get("user_email")
+
+        print(f"🔍 Processing query from {user_email} (Company: {company_id}): {query}")
 
         if not query:
             await cl.Message(
@@ -848,18 +1049,32 @@ async def main(message: cl.Message):
         result = None
         if company_id:
             result = await search_faqs_by_embedding(query, company_id)
+        else:
+            result = {
+                'answer': "I don't have access to your company's FAQs. Please contact your administrator.",
+                'confidence': 0.0,
+                'source': 'system',
+                'embedding_type': 'static-retrieval-mrl-en-v1'
+            }
 
         # Generate response
-        if result:
+        if result and result.get('source') == 'faq':
             confidence_emoji = "🎯" if result['confidence'] > 0.9 else "✅" if result['confidence'] > 0.7 else "💭"
             response = f"""{confidence_emoji} **Here's what I found:**
 
 {result['answer']}
 
 ---
-*Confidence: {result['confidence']:.1%} | Embedding: {result['embedding_type']}*"""
+*Confidence: {result['confidence']:.1%} | Source: {result['source']} | Model: {result['embedding_type']}*"""
         else:
-            response = await chatbot.generate_response(query, [], company_id=company_id)
+            # Fallback to AI generation
+            ai_response = await chatbot.generate_response(query, [], company_id=company_id)
+            response = f"""🤖 **AI Assistant Response:**
+
+{ai_response}
+
+---
+*Note: This response was generated by AI since no specific FAQ was found in your company's knowledge base.*"""
 
         await cl.Message(content=response).send()
         
@@ -869,8 +1084,10 @@ async def main(message: cl.Message):
 
     except Exception as e:
         print(f"Message handling error: {e}")
+        import traceback
+        traceback.print_exc()
         await cl.Message(
-            content=f"❌ **Error**: {str(e)}"
+            content=f"❌ **Error**: I encountered an issue processing your request. Please try again.\n\nError details: {str(e)}"
         ).send()
 
 # Cleanup function
@@ -891,6 +1108,7 @@ if __name__ == "__main__":
     print(f"🗄️ Database: {'✅ Connected' if DATABASE_URL else '❌ Missing DATABASE_URL'}")
     print(f"🤖 OpenAI: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing OPENAI_API_KEY'}")
     print(f"⚡ Embedding Model: static-retrieval-mrl-en-v1 (Ultra-fast CPU)")
+    print("🚫 Chainlit Data Layer: Disabled (prevents database conflicts)")
     
     # Run FastAPI server
     uvicorn.run(app, host="0.0.0.0", port=5000)

@@ -154,10 +154,12 @@ async def init_auth_tables():
         if conn:
             await conn.close()
 
-def generate_token(user_id, company_id):
-    """Generate JWT token with extended expiration"""
+def generate_token(user_id, company_id, email=None):
+    """Generate JWT token with proper payload structure"""
     payload = {
-        'user_id': user_id,
+        'sub': user_id,  # Standard JWT subject
+        'user_id': user_id,  # For backward compatibility
+        'email': email,  # Include email in token
         'company_id': company_id,
         'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24),
         'iat': datetime.datetime.utcnow(),
@@ -313,15 +315,16 @@ async def create_chainlit_user(email, company_id, user_id):
             'embedding_model': 'static-retrieval-mrl-en-v1'
         }
         
+        # Delete old records for this identifier to avoid conflicts
+        await conn.execute("DELETE FROM chainlit_users WHERE identifier = $1", email)
+        
+        # Insert fresh record
         await conn.execute("""
             INSERT INTO chainlit_users (identifier, email, company_id, metadata, last_login)
             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-            ON CONFLICT (identifier) DO UPDATE SET
-                email = $2,
-                company_id = $3,
-                metadata = $4,
-                last_login = CURRENT_TIMESTAMP
         """, email, email, company_id, json.dumps(metadata))
+        
+        print(f"✅ Chainlit user created/updated: {email}")
         
     except Exception as e:
         print(f"Error creating chainlit user: {e}")
@@ -492,30 +495,36 @@ def signup():
                 
             email = data.get('email')
             password = data.get('password')
-            company_code = data.get('company_code', 'default')  # Default fallback
+            company_code = data.get('company_code', 'default')
             
             if not email or not password:
                 return jsonify({'error': 'Email and password are required'}), 400
             
+            print(f"🔍 Signup attempt for: {email} (Company: {company_code})")
+            
             # Check if company exists
             company = await get_company_by_code(company_code)
             if not company:
+                print(f"❌ Invalid company code: {company_code}")
                 return jsonify({'error': 'Invalid company code'}), 400
             
             # Check if user already exists
             existing_user = await get_user_by_email(email)
             if existing_user:
+                print(f"❌ User already exists: {email}")
                 return jsonify({'error': 'User already exists'}), 400
             
             # Create user
             password_hash = generate_password_hash(password)
             user_id = await create_user(email, password_hash, company['id'])
             
+            print(f"✅ User created: {email} (ID: {user_id}, Company: {company['id']})")
+            
             # Create Chainlit user for seamless integration
             await create_chainlit_user(email, company['id'], user_id)
             
-            # Generate token
-            token = generate_token(user_id, company['id'])
+            # Generate token with email included
+            token = generate_token(user_id, company['id'], email)
             await create_user_session(user_id, token)
             
             return jsonify({
@@ -533,6 +542,8 @@ def signup():
             
         except Exception as e:
             print(f"Signup error: {e}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': str(e)}), 500
     
     return run_async(async_signup())
@@ -551,20 +562,26 @@ def login():
             if not email or not password:
                 return jsonify({'error': 'Email and password are required'}), 400
             
+            print(f"🔍 Login attempt for: {email}")
+            
             # Get user
             user = await get_user_by_email(email)
             if not user or not user['is_active']:
+                print(f"❌ User not found or inactive: {email}")
                 return jsonify({'error': 'Invalid credentials'}), 401
             
             # Check password
             if not check_password_hash(user['password_hash'], password):
+                print(f"❌ Invalid password for: {email}")
                 return jsonify({'error': 'Invalid credentials'}), 401
+            
+            print(f"✅ Login successful for: {email} (ID: {user['id']}, Company: {user['company_id']})")
             
             # Create/update Chainlit user for seamless integration
             await create_chainlit_user(email, user['company_id'], user['id'])
             
-            # Generate token
-            token = generate_token(user['id'], user['company_id'])
+            # Generate token with email included
+            token = generate_token(user['id'], user['company_id'], email)
             await create_user_session(user['id'], token)
             
             return jsonify({
@@ -572,7 +589,7 @@ def login():
                 'token': token,
                 'user': {
                     'id': user['id'],
-                    'email': user['email'],
+                    'email': user['email'],  # Use the actual email from database
                     'company_id': user['company_id']
                 },
                 'embedding_model': 'static-retrieval-mrl-en-v1',
@@ -581,6 +598,8 @@ def login():
             
         except Exception as e:
             print(f"Login error: {e}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': str(e)}), 500
     
     return run_async(async_login())
@@ -625,21 +644,39 @@ def chainlit_auth():
             if not payload:
                 return jsonify({'error': 'Invalid or expired token'}), 401
             
-            # Get user with company information
-            user_info = await get_user_with_company(payload['user_id'])
+            user_id = payload.get('user_id') or payload.get('sub')
+            user_email = payload.get('email')
+            
+            print(f"🔍 Chainlit auth for user_id: {user_id}, email: {user_email}")
+            
+            # Get fresh user info from database
+            user_info = await get_user_with_company(user_id)
             if not user_info:
                 return jsonify({'error': 'User not found'}), 404
             
+            # Use database email as source of truth
+            actual_email = user_info['email']
+            
+            print(f"✅ Chainlit auth successful: {actual_email} (Company: {user_info['company_id']})")
+            
             return jsonify({
                 'authenticated': True,
-                'user': user_info,
+                'user': {
+                    'id': user_info['id'],
+                    'email': actual_email,  # Use actual email from database
+                    'company_id': user_info['company_id'],
+                    'company_name': user_info['company_name'],
+                    'company_code': user_info['company_code']
+                },
                 'embedding_model': 'static-retrieval-mrl-en-v1',
                 'performance': '100x-400x faster on CPU',
-                'token': token  # Return token for Chainlit to use
+                'token': token
             })
             
         except Exception as e:
             print(f"Chainlit auth error: {e}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': str(e)}), 500
     
     return run_async(async_chainlit_auth())
