@@ -17,219 +17,244 @@ from sentence_transformers import SentenceTransformer
 
 # Load .env
 load_dotenv()
+
+# Set Chainlit environment variables BEFORE importing chainlit
+os.environ["CHAINLIT_ALLOW_ORIGINS"] = '["*"]'
+
+# Set Chainlit JWT secret from environment
+CHAINLIT_AUTH_SECRET = os.getenv('CHAINLIT_AUTH_SECRET')
+if CHAINLIT_AUTH_SECRET:
+    os.environ["CHAINLIT_AUTH_SECRET"] = CHAINLIT_AUTH_SECRET
+else:
+    # Generate a temporary secret if not provided
+    import secrets
+    temp_secret = secrets.token_urlsafe(32)
+    os.environ["CHAINLIT_AUTH_SECRET"] = temp_secret
+    print("⚠️ Warning: Using temporary Chainlit auth secret. Set CHAINLIT_AUTH_SECRET in .env for production.")
+
 DATABASE_URL = os.getenv('DATABASE_URL')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads')
-os.environ["CHAINLIT_ALLOW_ORIGINS"] = '["*"]'
+
 # Disable Chainlit's data layer to avoid conflicts
 cl.data_layer = None
 
-# Initialize OpenAI client properly for v1.84.0 (only for text processing, not embeddings)
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Initialize the static embedding model (runs 100x-400x faster on CPU)
-print("Loading static embedding model...")
-embedding_model = SentenceTransformer('sentence-transformers/static-retrieval-mrl-en-v1')
-print("Static embedding model loaded successfully!")
+# Initialize the static embedding model
+print("🚀 Loading static embedding model...")
+try:
+    embedding_model = SentenceTransformer('sentence-transformers/static-retrieval-mrl-en-v1')
+    print("✅ Static embedding model loaded successfully!")
+except Exception as e:
+    print(f"❌ Error loading embedding model: {e}")
+    embedding_model = None
 
 # Ensure upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Global connection pool
+connection_pool = None
+
+async def init_connection_pool():
+    """Initialize database connection pool"""
+    global connection_pool
+    if connection_pool is None:
+        try:
+            connection_pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=2,
+                max_size=20,
+                command_timeout=60,
+                server_settings={'jit': 'off'}
+            )
+            print("✅ Database connection pool initialized")
+        except Exception as e:
+            print(f"❌ Failed to create database connection pool: {e}")
+            raise
+
 async def get_db_connection():
-    """Get direct database connection"""
+    """Get database connection with error handling"""
+    global connection_pool
+    if connection_pool is None:
+        await init_connection_pool()
     try:
-        return await asyncpg.connect(DATABASE_URL)
+        return await asyncio.wait_for(connection_pool.acquire(), timeout=15.0)
+    except asyncio.TimeoutError:
+        raise Exception("Database connection timeout")
     except Exception as e:
-        print(f"Error connecting to database: {e}")
+        print(f"Database connection error: {e}")
         raise
+
+async def release_db_connection(conn):
+    """Release database connection"""
+    global connection_pool
+    if connection_pool and conn:
+        await connection_pool.release(conn)
 
 class DatabaseManager:
     def __init__(self):
-        self.pool = None
-
-    async def init_pool(self):
-        """Initialize the database connection pool"""
-        if not self.pool:
-            self.pool = await asyncpg.create_pool(DATABASE_URL)
-        return self.pool
+        pass
 
     async def init_database(self):
         """Create tables if they don't exist"""
-        await self.init_pool()
-        async with self.pool.acquire() as conn:
-            try:
-                # Create companies table
+        conn = None
+        try:
+            conn = await get_db_connection()
+            
+            # Create companies table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS companies (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    code VARCHAR(50) NOT NULL UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Create faq_data table with company_id
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS faq_data (
+                    id SERIAL PRIMARY KEY,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    embedding FLOAT8[] NOT NULL,
+                    doc_id INTEGER,
+                    company_id INTEGER REFERENCES companies(id),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Create doc_data table with company_id
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS doc_data (
+                    id SERIAL PRIMARY KEY,
+                    doc_name VARCHAR(255) NOT NULL,
+                    doc_path VARCHAR(500) NOT NULL,
+                    doc_content TEXT,
+                    doc_status VARCHAR(50) DEFAULT 'pending',
+                    file_size BIGINT,
+                    total_faqs INTEGER DEFAULT 0,
+                    processing_time INTEGER,
+                    error_message TEXT,
+                    uploaded_by VARCHAR(255),
+                    company_id INTEGER REFERENCES companies(id),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    processed_at TIMESTAMP
+                )
+            """)
+
+            # Create indexes for better performance
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_status ON doc_data(doc_status)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_doc_id ON faq_data(doc_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_company_id ON faq_data(company_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_company_id ON doc_data(company_id)")
+
+            # Insert default companies if none exist
+            company_exists = await conn.fetchval("SELECT COUNT(*) FROM companies")
+            if company_exists == 0:
                 await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS companies (
-                        id SERIAL PRIMARY KEY,
-                        name VARCHAR(255) NOT NULL,
-                        code VARCHAR(50) NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
+                    INSERT INTO companies (name, code) VALUES 
+                    ('Default Company', 'default'),
+                    ('Demo Company', 'demo'),
+                    ('Test Company', 'test')
                 """)
+                print("✅ Default companies created")
 
-                # Create faq_data table with company_id
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS faq_data (
-                        id SERIAL PRIMARY KEY,
-                        question TEXT NOT NULL,
-                        answer TEXT NOT NULL,
-                        embedding FLOAT8[] NOT NULL,
-                        doc_id INTEGER,
-                        company_id INTEGER,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+            print("✅ Database tables initialized")
 
-                # Create document_status table
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS document_status (
-                        id SERIAL PRIMARY KEY,
-                        doc_id INTEGER NOT NULL,
-                        doc_status VARCHAR(50) NOT NULL,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-
-                # Create doc_data table with company_id
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS doc_data (
-                        id SERIAL PRIMARY KEY,
-                        doc_name VARCHAR(255) NOT NULL,
-                        doc_path VARCHAR(500) NOT NULL,
-                        doc_content TEXT,
-                        doc_status VARCHAR(50) DEFAULT 'pending',
-                        file_size BIGINT,
-                        total_faqs INTEGER DEFAULT 0,
-                        processing_time INTEGER,
-                        error_message TEXT,
-                        uploaded_by VARCHAR(255),
-                        company_id INTEGER,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        processed_at TIMESTAMP
-                    )
-                """)
-
-                # Create indexes for better performance
-                await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_status ON doc_data(doc_status)")
-                await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_doc_id ON faq_data(doc_id)")
-                await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_company_id ON faq_data(company_id)")
-                await conn.execute("CREATE INDEX IF NOT EXISTS idx_document_status_doc_id ON document_status(doc_id)")
-                await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_company_id ON doc_data(company_id)")
-
-                print("Database tables initialized")
-
-            except Exception as e:
-                print(f"Error initializing database: {e}")
-                raise
+        except Exception as e:
+            print(f"Error initializing database: {e}")
+            raise
+        finally:
+            if conn:
+                await release_db_connection(conn)
 
     async def get_company_by_name_or_code(self, identifier):
         """Get company by name or code"""
-        await self.init_pool()
-        async with self.pool.acquire() as conn:
+        conn = None
+        try:
+            conn = await get_db_connection()
             return await conn.fetchrow("""
                 SELECT id, name, code FROM companies
-                WHERE name = $1 OR code = $1
-            """, identifier)
-
-    async def update_document_status(self, doc_id, status):
-        """Update or insert document status in document_status table"""
-        await self.init_pool()
-        async with self.pool.acquire() as conn:
-            try:
-                doc_id = int(doc_id)
-                status = str(status)
-
-                # Check if status record exists
-                existing = await conn.fetchrow("SELECT id FROM document_status WHERE doc_id = $1", doc_id)
-
-                if existing:
-                    # Update existing record
-                    await conn.execute("""
-                        UPDATE document_status 
-                        SET doc_status = $1, updated_at = $2 
-                        WHERE doc_id = $3
-                    """, status, datetime.now(), doc_id)
-                else:
-                    # Insert new record
-                    await conn.execute("""
-                        INSERT INTO document_status (doc_id, doc_status, updated_at)
-                        VALUES ($1, $2, $3)
-                    """, doc_id, status, datetime.now())
-
-            except Exception as e:
-                print(f"Error updating document status: {e}")
+                WHERE LOWER(name) = LOWER($1) OR LOWER(code) = LOWER($1)
+            """, identifier.strip())
+        finally:
+            if conn:
+                await release_db_connection(conn)
 
     async def get_all_documents(self):
         """Get all documents with their processing status"""
-        await self.init_pool()
-        async with self.pool.acquire() as conn:
-            try:
-                docs = await conn.fetch("""
-                    SELECT dd.id, dd.doc_name, dd.doc_status, 
-                           COALESCE(dd.file_size, 0) as file_size, 
-                           COALESCE(dd.total_faqs, 0) as total_faqs,
-                           COALESCE(dd.processing_time, 0) as processing_time,
-                           dd.created_at, dd.processed_at, dd.error_message, dd.uploaded_by,
-                           ds.doc_status as status_table_status, ds.updated_at as status_updated_at,
-                           c.name as company_name
-                    FROM doc_data dd
-                    LEFT JOIN document_status ds ON dd.id = ds.doc_id
-                    LEFT JOIN companies c ON dd.company_id = c.id
-                    ORDER BY dd.created_at DESC
-                """)
-                return [dict(doc) for doc in docs]
-            except Exception as e:
-                print(f"Error getting documents: {e}")
-                return []
+        conn = None
+        try:
+            conn = await get_db_connection()
+            docs = await conn.fetch("""
+                SELECT dd.id, dd.doc_name, dd.doc_status, 
+                       COALESCE(dd.file_size, 0) as file_size, 
+                       COALESCE(dd.total_faqs, 0) as total_faqs,
+                       COALESCE(dd.processing_time, 0) as processing_time,
+                       dd.created_at, dd.processed_at, dd.error_message, dd.uploaded_by,
+                       c.name as company_name, c.code as company_code
+                FROM doc_data dd
+                LEFT JOIN companies c ON dd.company_id = c.id
+                ORDER BY dd.created_at DESC
+            """)
+            return [dict(doc) for doc in docs]
+        except Exception as e:
+            print(f"Error getting documents: {e}")
+            return []
+        finally:
+            if conn:
+                await release_db_connection(conn)
 
     async def delete_document(self, doc_id):
         """Delete document and its FAQs"""
-        await self.init_pool()
-        async with self.pool.acquire() as conn:
-            try:
-                doc_id = int(doc_id)  # Ensure integer type
+        conn = None
+        try:
+            conn = await get_db_connection()
+            doc_id = int(doc_id)
 
-                # Get document info first for logging
-                doc = await conn.fetchrow("SELECT id, doc_name, doc_path FROM doc_data WHERE id = $1", doc_id)
+            # Get document info first for logging
+            doc = await conn.fetchrow("SELECT id, doc_name, doc_path FROM doc_data WHERE id = $1", doc_id)
 
-                if not doc:
-                    print(f"Document with ID {doc_id} not found")
-                    return False
-
-                # Delete physical file if it exists
-                if doc['doc_path'] and os.path.exists(doc['doc_path']):
-                    try:
-                        os.remove(doc['doc_path'])
-                        print(f"Deleted file: {doc['doc_path']}")
-                    except Exception as e:
-                        print(f"Warning: Could not delete file {doc['doc_path']}: {e}")
-
-                # Delete FAQs first (foreign key constraint)
-                faq_count = await conn.fetchval("SELECT COUNT(*) FROM faq_data WHERE doc_id = $1", doc_id)
-                await conn.execute("DELETE FROM faq_data WHERE doc_id = $1", doc_id)
-                print(f"Deleted {faq_count} FAQs for document {doc_id}")
-
-                # Delete from document_status table
-                await conn.execute("DELETE FROM document_status WHERE doc_id = $1", doc_id)
-
-                # Delete document record
-                result = await conn.execute("DELETE FROM doc_data WHERE id = $1", doc_id)
-
-                # Check if any rows were affected
-                if result == "DELETE 0":
-                    print(f"No document found with ID {doc_id}")
-                    return False
-
-                print(f"Successfully deleted document: {doc['doc_name']} (ID: {doc_id})")
-                return True
-
-            except ValueError as e:
-                print(f"Invalid doc_id format: {e}")
+            if not doc:
+                print(f"Document with ID {doc_id} not found")
                 return False
-            except Exception as e:
-                print(f"Error deleting document {doc_id}: {e}")
+
+            # Delete physical file if it exists
+            if doc['doc_path'] and os.path.exists(doc['doc_path']):
+                try:
+                    os.remove(doc['doc_path'])
+                    print(f"Deleted file: {doc['doc_path']}")
+                except Exception as e:
+                    print(f"Warning: Could not delete file {doc['doc_path']}: {e}")
+
+            # Delete FAQs first (foreign key constraint)
+            faq_count = await conn.fetchval("SELECT COUNT(*) FROM faq_data WHERE doc_id = $1", doc_id)
+            await conn.execute("DELETE FROM faq_data WHERE doc_id = $1", doc_id)
+            print(f"Deleted {faq_count} FAQs for document {doc_id}")
+
+            # Delete document record
+            result = await conn.execute("DELETE FROM doc_data WHERE id = $1", doc_id)
+
+            # Check if any rows were affected
+            if result == "DELETE 0":
+                print(f"No document found with ID {doc_id}")
                 return False
+
+            print(f"Successfully deleted document: {doc['doc_name']} (ID: {doc_id})")
+            return True
+
+        except ValueError as e:
+            print(f"Invalid doc_id format: {e}")
+            return False
+        except Exception as e:
+            print(f"Error deleting document {doc_id}: {e}")
+            return False
+        finally:
+            if conn:
+                await release_db_connection(conn)
 
 class DocumentProcessor:
     @staticmethod
@@ -253,6 +278,9 @@ class DocumentProcessor:
         prompt = f"Please extract and clean the important textual content from the following PDF text. Remove any formatting artifacts and present only the meaningful content:\n\n{raw_text}\n\nExtracted and cleaned text:"
 
         try:
+            if not client:
+                return raw_text  # Return raw text if OpenAI not available
+                
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -265,17 +293,22 @@ class DocumentProcessor:
             extracted_text = response.choices[0].message.content.strip()
             return extracted_text
         except Exception as e:
-            return f"OpenAI API error: {e}"
+            print(f"OpenAI API error: {e}")
+            return raw_text  # Return raw text as fallback
 
 class FAQGenerator:
     def __init__(self, api_key):
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key) if api_key else None
         # Use the global static embedding model instead of OpenAI embeddings
         self.embedding_model = embedding_model
 
     def generate_embedding(self, text):
         """Generate embedding using static-retrieval-mrl-en-v1 model (100x-400x faster on CPU)"""
         try:
+            if not self.embedding_model:
+                print("Embedding model not loaded")
+                return None
+                
             # Use the static embedding model instead of OpenAI
             embedding = self.embedding_model.encode(text, normalize_embeddings=True)
             
@@ -287,6 +320,10 @@ class FAQGenerator:
 
     def generate_faqs_from_text(self, text):
         """Generate FAQs from document text"""
+        if not self.client:
+            print("OpenAI client not configured")
+            return []
+            
         # Limit text to avoid token limits
         if len(text) > 8000:
             limited_text = text[:4000] + "\n...\n" + text[-4000:]
@@ -371,14 +408,12 @@ async def start():
         # Initialize database
         await db_manager.init_database()
 
-        # Send welcome message without company prompt
-        welcome_msg = """🔧 **Document Insertion Admin Panel**
+        # Send welcome message
+        welcome_msg = """🔧 **Document Processing Admin Panel**
 
 Welcome to the PDF document processing interface!
 
-🚀 **NEW: Now using ultra-fast static embedding model (100x-400x faster on CPU!)**
-
-📚 **Current Documents:** No documents uploaded yet.
+🚀 **NOW USING: Ultra-fast static embedding model (100x-400x faster on CPU!)**
 
 **Available Commands:**
 • 📤 **Upload PDF**: Use the attachment button to upload PDF files
@@ -388,11 +423,12 @@ Welcome to the PDF document processing interface!
 • 📊 **Stats**: Type 'stats' for processing statistics
 • ❓ **Help**: Type 'help' for command list
 
-You can **upload multiple PDFs at once** — After uploading, you'll be prompted for the company name or code to associate with the document.
+You can **upload multiple PDFs at once**. After uploading, you'll be prompted for the company name or code to associate with the document.
 
 **Examples:**
 - `delete 1` – Delete document with ID 1
 - `reprocess 2` – Reprocess document with ID 2
+- `status` – Show all documents
 """
 
         await cl.Message(content=welcome_msg).send()
@@ -506,7 +542,7 @@ async def process_pdf_upload(file_path, filename):
 
         # Prompt for company name or code
         company_input = await cl.AskUserMessage(
-            content="🏢 Please enter the company name or code for FAQ generation:"
+            content="🏢 Please enter the company name or code for this document:"
         ).send()
 
         # Handle different response formats
@@ -527,115 +563,101 @@ async def process_pdf_upload(file_path, filename):
             return False
 
         # Get company record
-        await db_manager.init_pool()
-        async with db_manager.pool.acquire() as conn:
-            company_record = await db_manager.get_company_by_name_or_code(company_identifier.strip())
+        conn = await get_db_connection()
+        company_record = await db_manager.get_company_by_name_or_code(company_identifier.strip())
 
-            if not company_record:
-                await cl.Message(
-                    content=f"❌ Company '{company_identifier}' not found. Please contact admin or try again."
-                ).send()
-                return False
+        if not company_record:
+            await cl.Message(
+                content=f"❌ Company '{company_identifier}' not found. Available companies: 'default', 'demo', 'test'. Please contact admin to add new companies."
+            ).send()
+            return False
 
-            company_id = company_record['id']
+        company_id = company_record['id']
 
-            # Save to permanent location
-            permanent_filename = str(uuid.uuid4()) + '_' + filename
-            permanent_path = str(os.path.join(UPLOAD_FOLDER, permanent_filename))
-            shutil.copy2(file_path, permanent_path)
+        # Save to permanent location
+        permanent_filename = str(uuid.uuid4()) + '_' + filename
+        permanent_path = str(os.path.join(UPLOAD_FOLDER, permanent_filename))
+        shutil.copy2(file_path, permanent_path)
 
-            # Insert document into database with company_id
-            doc_id = await conn.fetchval("""
-                INSERT INTO doc_data (doc_name, doc_path, doc_content, doc_status, file_size, uploaded_by, company_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
-            """, filename, permanent_path, None, 'processing', file_size, 'admin', company_id)
+        # Insert document into database with company_id
+        doc_id = await conn.fetchval("""
+            INSERT INTO doc_data (doc_name, doc_path, doc_content, doc_status, file_size, uploaded_by, company_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+        """, filename, permanent_path, None, 'processing', file_size, 'admin', company_id)
 
-            # Ensure doc_id is integer
-            doc_id = int(doc_id)
+        # Ensure doc_id is integer
+        doc_id = int(doc_id)
 
-            # Update document_status table
-            await db_manager.update_document_status(doc_id, 'processing')
+        # Extract text from PDF
+        text = DocumentProcessor.extract_text_from_pdf(permanent_path)
 
-            # Extract text from PDF
-            text = DocumentProcessor.extract_text_from_pdf(permanent_path)
-
-            if not text or len(text.strip()) < 200:
-                await conn.execute("""
-                    UPDATE doc_data
-                    SET doc_status = $1, error_message = $2, processed_at = $3
-                    WHERE id = $4
-                """, 'failed', 'Could not extract sufficient text from PDF', datetime.now(), doc_id)
-
-                # Update document_status table
-                await db_manager.update_document_status(doc_id, 'failed')
-                return False
-
-            # Update document with extracted text
-            await conn.execute("UPDATE doc_data SET doc_content = $1 WHERE id = $2", str(text), doc_id)
-
-            # Generate FAQs from the extracted text using static embeddings
-            faqs = faq_generator.generate_faqs_from_text(text)
-
-            if not faqs:
-                await conn.execute("""
-                    UPDATE doc_data
-                    SET doc_status = $1, error_message = $2, processed_at = $3
-                    WHERE id = $4
-                """, 'failed', 'Could not generate FAQs from document content', datetime.now(), doc_id)
-
-                # Update document_status table
-                await db_manager.update_document_status(doc_id, 'failed')
-                return False
-
-            # Store FAQs with static embeddings and company_id
-            stored_faqs = 0
-            for faq in faqs:
-                embedding = faq_generator.generate_embedding(faq['question'])
-                if embedding:
-                    # Ensure proper types
-                    question = str(faq['question'])
-                    answer = str(faq['answer'])
-
-                    await conn.execute("""
-                        INSERT INTO faq_data (question, answer, embedding, doc_id, company_id)
-                        VALUES ($1, $2, $3, $4, $5)
-                    """, question, answer, embedding, doc_id, company_id)
-                    stored_faqs += 1
-
-            # Calculate processing time
-            processing_time = int((datetime.now() - start_time).total_seconds())
-
-            # Update document status
+        if not text or len(text.strip()) < 200:
             await conn.execute("""
                 UPDATE doc_data
-                SET doc_status = $1, total_faqs = $2, processing_time = $3, processed_at = $4
-                WHERE id = $5
-            """, 'completed', stored_faqs, processing_time, datetime.now(), doc_id)
+                SET doc_status = $1, error_message = $2, processed_at = $3
+                WHERE id = $4
+            """, 'failed', 'Could not extract sufficient text from PDF', datetime.now(), doc_id)
+            return False
 
-            # Update document_status table
-            await db_manager.update_document_status(doc_id, 'completed')
+        # Update document with extracted text
+        await conn.execute("UPDATE doc_data SET doc_content = $1 WHERE id = $2", str(text), doc_id)
 
-            await cl.Message(
-                content=f"✅ **{filename}** processed successfully for company '{company_identifier}'!\n🚀 Generated {stored_faqs} FAQs in {processing_time}s using ultra-fast static embeddings!"
-            ).send()
+        # Generate FAQs from the extracted text using static embeddings
+        faqs = faq_generator.generate_faqs_from_text(text)
 
-            return True
+        if not faqs:
+            await conn.execute("""
+                UPDATE doc_data
+                SET doc_status = $1, error_message = $2, processed_at = $3
+                WHERE id = $4
+            """, 'failed', 'Could not generate FAQs from document content', datetime.now(), doc_id)
+            return False
+
+        # Store FAQs with static embeddings and company_id
+        stored_faqs = 0
+        for faq in faqs:
+            embedding = faq_generator.generate_embedding(faq['question'])
+            if embedding:
+                # Ensure proper types
+                question = str(faq['question'])
+                answer = str(faq['answer'])
+
+                await conn.execute("""
+                    INSERT INTO faq_data (question, answer, embedding, doc_id, company_id)
+                    VALUES ($1, $2, $3, $4, $5)
+                """, question, answer, embedding, doc_id, company_id)
+                stored_faqs += 1
+
+        # Calculate processing time
+        processing_time = int((datetime.now() - start_time).total_seconds())
+
+        # Update document status
+        await conn.execute("""
+            UPDATE doc_data
+            SET doc_status = $1, total_faqs = $2, processing_time = $3, processed_at = $4
+            WHERE id = $5
+        """, 'completed', stored_faqs, processing_time, datetime.now(), doc_id)
+
+        await cl.Message(
+            content=f"✅ **{filename}** processed successfully for company '{company_identifier}'!\n🚀 Generated {stored_faqs} FAQs in {processing_time}s using ultra-fast static embeddings!"
+        ).send()
+
+        return True
 
     except Exception as e:
         print(f"Error processing {filename}: {e}")
-        if 'doc_id' in locals():
-            async with db_manager.pool.acquire() as conn:
-                await conn.execute("""
-                    UPDATE doc_data
-                    SET doc_status = $1, error_message = $2, processed_at = $3
-                    WHERE id = $4
-                """, 'failed', str(e), datetime.now(), doc_id)
-
-                # Update document_status table
-                await db_manager.update_document_status(doc_id, 'failed')
+        if 'doc_id' in locals() and conn:
+            await conn.execute("""
+                UPDATE doc_data
+                SET doc_status = $1, error_message = $2, processed_at = $3
+                WHERE id = $4
+            """, 'failed', str(e), datetime.now(), doc_id)
 
         await cl.Message(content=f"❌ **{filename}** processing failed: {str(e)}").send()
         return False
+    finally:
+        if conn:
+            await release_db_connection(conn)
 
 async def show_document_status():
     """Show status of all documents"""
@@ -656,14 +678,8 @@ async def show_document_status():
         }.get(doc.get('doc_status', 'unknown'), '❓')
 
         status_msg += f"**ID {doc.get('id', 'N/A')}**: {status_emoji} {doc.get('doc_name', 'Unknown')}\n"
-        status_msg += f"   🏢 Company: {doc.get('company_name', 'N/A')}\n"
-        status_msg += f"   📊 Main Status: {doc.get('doc_status', 'unknown').title()}\n"
-
-        # Show status table info if available
-        if doc.get('status_table_status'):
-            status_msg += f"   🔄 Status Table: {doc.get('status_table_status', 'N/A')}\n"
-            if doc.get('status_updated_at'):
-                status_msg += f"   🕒 Status Updated: {doc['status_updated_at'].strftime('%Y-%m-%d %H:%M')}\n"
+        status_msg += f"   🏢 Company: {doc.get('company_name', 'N/A')} ({doc.get('company_code', 'N/A')})\n"
+        status_msg += f"   📊 Status: {doc.get('doc_status', 'unknown').title()}\n"
 
         # Safe handling of file_size
         file_size = doc.get('file_size', 0)
@@ -692,59 +708,38 @@ async def show_document_status():
 
 async def show_processing_stats():
     """Show processing statistics"""
-    await db_manager.init_pool()
-    async with db_manager.pool.acquire() as conn:
-        try:
-            # Get stats from both tables
-            stats = await conn.fetchrow("""
-                SELECT
-                    COUNT(*) as total_docs,
-                    COUNT(*) FILTER (WHERE doc_status = 'completed') as completed_docs,
-                    COUNT(*) FILTER (WHERE doc_status = 'failed') as failed_docs,
-                    COUNT(*) FILTER (WHERE doc_status = 'processing') as processing_docs,
-                    COALESCE(SUM(total_faqs), 0) as total_faqs,
-                    COALESCE(AVG(processing_time), 0) as avg_processing_time,
-                    COALESCE(SUM(file_size), 0) as total_file_size
-                FROM doc_data
-            """)
+    conn = None
+    try:
+        conn = await get_db_connection()
+        stats = await conn.fetchrow("""
+            SELECT
+                COUNT(*) as total_docs,
+                COUNT(*) FILTER (WHERE doc_status = 'completed') as completed_docs,
+                COUNT(*) FILTER (WHERE doc_status = 'failed') as failed_docs,
+                COUNT(*) FILTER (WHERE doc_status = 'processing') as processing_docs,
+                COALESCE(SUM(total_faqs), 0) as total_faqs,
+                COALESCE(AVG(processing_time), 0) as avg_processing_time,
+                COALESCE(SUM(file_size), 0) as total_file_size
+            FROM doc_data
+        """)
 
-            # Get status table stats
-            status_stats = await conn.fetchrow("""
-                SELECT
-                    COUNT(*) as status_records,
-                    COUNT(*) FILTER (WHERE doc_status = 'completed') as status_completed,
-                    COUNT(*) FILTER (WHERE doc_status = 'failed') as status_failed,
-                    COUNT(*) FILTER (WHERE doc_status = 'processing') as status_processing
-                FROM document_status
-            """)
+        # Safe handling of stats with default values
+        total_docs = stats.get('total_docs', 0)
+        completed_docs = stats.get('completed_docs', 0)
+        failed_docs = stats.get('failed_docs', 0)
+        processing_docs = stats.get('processing_docs', 0)
+        total_faqs = stats.get('total_faqs', 0)
+        avg_processing_time = stats.get('avg_processing_time', 0)
+        total_file_size = stats.get('total_file_size', 0)
 
-            # Safe handling of stats with default values
-            total_docs = stats.get('total_docs', 0)
-            completed_docs = stats.get('completed_docs', 0)
-            failed_docs = stats.get('failed_docs', 0)
-            processing_docs = stats.get('processing_docs', 0)
-            total_faqs = stats.get('total_faqs', 0)
-            avg_processing_time = stats.get('avg_processing_time', 0)
-            total_file_size = stats.get('total_file_size', 0)
+        success_rate = (completed_docs / max(total_docs, 1) * 100) if total_docs > 0 else 0
 
-            status_records = status_stats.get('status_records', 0)
-            status_completed = status_stats.get('status_completed', 0)
-            status_failed = status_stats.get('status_failed', 0)
-            status_processing = status_stats.get('status_processing', 0)
-
-            success_rate = (completed_docs / max(total_docs, 1) * 100) if total_docs > 0 else 0
-
-            stats_msg = f"""📊 **Processing Statistics:**
+        stats_msg = f"""📊 **Processing Statistics:**
 
 📁 **Documents:** {total_docs} total
 ✅ **Completed:** {completed_docs}
 ❌ **Failed:** {failed_docs}
 🔄 **Processing:** {processing_docs}
-
-📋 **Status Table Records:** {status_records}
-   ✅ Status Completed: {status_completed}
-   ❌ Status Failed: {status_failed}
-   🔄 Status Processing: {status_processing}
 
 🤖 **Total FAQs Generated:** {total_faqs}
 ⚡ **Average Processing Time:** {avg_processing_time:.1f}s (with static embeddings)
@@ -754,10 +749,13 @@ async def show_processing_stats():
 
 🚀 **Performance Boost:** Using static-retrieval-mrl-en-v1 model (100x-400x faster on CPU!)
 """
-            await cl.Message(content=stats_msg).send()
+        await cl.Message(content=stats_msg).send()
 
-        except Exception as e:
-            await cl.Message(content=f"❌ Error getting stats: {str(e)}").send()
+    except Exception as e:
+        await cl.Message(content=f"❌ Error getting stats: {str(e)}").send()
+    finally:
+        if conn:
+            await release_db_connection(conn)
 
 async def delete_document(doc_id):
     """Delete a document and its FAQs with better error handling"""
@@ -768,23 +766,25 @@ async def delete_document(doc_id):
             return
 
         # First check if document exists
-        await db_manager.init_pool()
-        async with db_manager.pool.acquire() as conn:
+        conn = await get_db_connection()
+        try:
             doc = await conn.fetchrow("SELECT id, doc_name FROM doc_data WHERE id = $1", doc_id)
             if not doc:
                 await cl.Message(content=f"❌ **Document with ID {doc_id} not found.**\nUse `status` command to see available documents.").send()
                 return
 
-        # Show confirmation and proceed with deletion
-        await cl.Message(content=f"🗑️ **Deleting document:** {doc['doc_name']} (ID: {doc_id})...").send()
+            # Show confirmation and proceed with deletion
+            await cl.Message(content=f"🗑️ **Deleting document:** {doc['doc_name']} (ID: {doc_id})...").send()
 
-        # Perform deletion
-        success = await db_manager.delete_document(doc_id)
+            # Perform deletion
+            success = await db_manager.delete_document(doc_id)
 
-        if success:
-            await cl.Message(content=f"✅ **Document deleted successfully!**\n📄 **{doc['doc_name']}** (ID: {doc_id}) and all its FAQs have been removed.").send()
-        else:
-            await cl.Message(content=f"❌ **Failed to delete document {doc_id}.** Please check the logs for more details.").send()
+            if success:
+                await cl.Message(content=f"✅ **Document deleted successfully!**\n📄 **{doc['doc_name']}** (ID: {doc_id}) and all its FAQs have been removed.").send()
+            else:
+                await cl.Message(content=f"❌ **Failed to delete document {doc_id}.** Please check the logs for more details.").send()
+        finally:
+            await release_db_connection(conn)
 
     except Exception as e:
         print(f"Error in delete_document function: {e}")
@@ -792,69 +792,80 @@ async def delete_document(doc_id):
 
 async def reprocess_document(doc_id):
     """Reprocess a document to regenerate FAQs using static embeddings"""
-    await db_manager.init_pool()
-    async with db_manager.pool.acquire() as conn:
-        try:
-            doc_id = int(doc_id)  # Ensure integer type
+    conn = None
+    try:
+        conn = await get_db_connection()
+        doc_id = int(doc_id)  # Ensure integer type
 
-            # Get document
-            doc = await conn.fetchrow("SELECT doc_name, doc_content, company_id FROM doc_data WHERE id = $1", doc_id)
+        # Get document
+        doc = await conn.fetchrow("SELECT doc_name, doc_content, company_id FROM doc_data WHERE id = $1", doc_id)
 
-            if not doc:
-                await cl.Message(content=f"❌ **Document {doc_id} not found.**\nUse `status` command to see available documents.").send()
-                return
+        if not doc:
+            await cl.Message(content=f"❌ **Document {doc_id} not found.**\nUse `status` command to see available documents.").send()
+            return
 
-            await cl.Message(content=f"🔄 **Reprocessing {doc['doc_name']} with ultra-fast static embeddings...**").send()
+        await cl.Message(content=f"🔄 **Reprocessing {doc['doc_name']} with ultra-fast static embeddings...**").send()
 
-            # Update status to processing
-            await conn.execute("UPDATE doc_data SET doc_status = $1 WHERE id = $2", 'processing', doc_id)
-            await db_manager.update_document_status(doc_id, 'processing')
+        # Update status to processing
+        await conn.execute("UPDATE doc_data SET doc_status = $1 WHERE id = $2", 'processing', doc_id)
 
-            # Delete existing FAQs
-            await conn.execute("DELETE FROM faq_data WHERE doc_id = $1", doc_id)
+        # Delete existing FAQs
+        await conn.execute("DELETE FROM faq_data WHERE doc_id = $1", doc_id)
 
-            # Generate new FAQs
-            faqs = faq_generator.generate_faqs_from_text(doc['doc_content'])
+        # Generate new FAQs
+        faqs = faq_generator.generate_faqs_from_text(doc['doc_content'])
 
-            if faqs:
-                stored_faqs = 0
-                for faq in faqs:
-                    embedding = faq_generator.generate_embedding(faq['question'])
-                    if embedding:
-                        # Ensure proper types
-                        question = str(faq['question'])
-                        answer = str(faq['answer'])
+        if faqs:
+            stored_faqs = 0
+            for faq in faqs:
+                embedding = faq_generator.generate_embedding(faq['question'])
+                if embedding:
+                    # Ensure proper types
+                    question = str(faq['question'])
+                    answer = str(faq['answer'])
 
-                        await conn.execute("""
-                            INSERT INTO faq_data (question, answer, embedding, doc_id, company_id)
-                            VALUES ($1, $2, $3, $4, $5)
-                        """, question, answer, embedding, doc_id, doc['company_id'])
-                        stored_faqs += 1
+                    await conn.execute("""
+                        INSERT INTO faq_data (question, answer, embedding, doc_id, company_id)
+                        VALUES ($1, $2, $3, $4, $5)
+                    """, question, answer, embedding, doc_id, doc['company_id'])
+                    stored_faqs += 1
 
-                # Update document status
-                await conn.execute("""
-                    UPDATE doc_data
-                    SET doc_status = $1, total_faqs = $2, processed_at = $3
-                    WHERE id = $4
-                """, 'completed', stored_faqs, datetime.now(), doc_id)
+            # Update document status
+            await conn.execute("""
+                UPDATE doc_data
+                SET doc_status = $1, total_faqs = $2, processed_at = $3
+                WHERE id = $4
+            """, 'completed', stored_faqs, datetime.now(), doc_id)
 
-                # Update document_status table
-                await db_manager.update_document_status(doc_id, 'completed')
+            await cl.Message(content=f"✅ **Reprocessing complete!** Generated {stored_faqs} new FAQs for **{doc['doc_name']}** using static embeddings.").send()
+        else:
+            await conn.execute("UPDATE doc_data SET doc_status = $1 WHERE id = $2", 'failed', doc_id)
+            await cl.Message(content=f"❌ **Reprocessing failed** - Could not generate FAQs for **{doc['doc_name']}**.").send()
 
-                await cl.Message(content=f"✅ **Reprocessing complete!** Generated {stored_faqs} new FAQs for **{doc['doc_name']}** using static embeddings.").send()
-            else:
-                await conn.execute("UPDATE doc_data SET doc_status = $1 WHERE id = $2", 'failed', doc_id)
-                await db_manager.update_document_status(doc_id, 'failed')
-                await cl.Message(content=f"❌ **Reprocessing failed** - Could not generate FAQs for **{doc['doc_name']}**.").send()
+    except ValueError:
+        await cl.Message(content="❌ **Invalid document ID.** Please provide a valid number.\nExample: `reprocess 1`").send()
+    except Exception as e:
+        await cl.Message(content=f"❌ **Reprocessing error:** {str(e)}").send()
+    finally:
+        if conn:
+            await release_db_connection(conn)
 
-        except ValueError:
-            await cl.Message(content="❌ **Invalid document ID.** Please provide a valid number.\nExample: `reprocess 1`").send()
-        except Exception as e:
-            await cl.Message(content=f"❌ **Reprocessing error:** {str(e)}").send()
+# Cleanup function
+async def cleanup():
+    global connection_pool
+    if connection_pool:
+        await connection_pool.close()
 
 if __name__ == "__main__":
-    print("PDF Document Processor Admin Panel Starting...")
-    print(f"Database URL: {'✅ Configured' if DATABASE_URL else '❌ Missing'}")
-    print(f"OpenAI API Key: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing'}")
-    print(f"Upload Folder: {UPLOAD_FOLDER}")
+    import atexit
+    
+    atexit.register(lambda: asyncio.run(cleanup()))
+    
+    print("🔧 PDF Document Processor Admin Panel Starting...")
+    print(f"📍 Admin panel at: http://localhost:8002")
+    print(f"🗄️ Database: {'✅ Connected' if DATABASE_URL else '❌ Missing DATABASE_URL'}")
+    print(f"🤖 OpenAI: {'✅ Configured' if OPENAI_API_KEY else '❌ Missing OPENAI_API_KEY'}")
+    print(f"📁 Upload Folder: {UPLOAD_FOLDER}")
     print("🚀 Using static-retrieval-mrl-en-v1 embedding model for 100x-400x faster performance on CPU!")
+    
+    # Run Chainlit admin server on port 8002

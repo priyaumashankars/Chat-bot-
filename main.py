@@ -14,13 +14,16 @@ import requests
 import hashlib
 import json
 from sentence_transformers import SentenceTransformer
+from contextlib import asynccontextmanager
+import traceback
+from functools import wraps
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 
-# Enhanced CORS configuration for Chainlit
+# Enhanced CORS configuration
 CORS(app, 
      origins=["*"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -31,12 +34,12 @@ CORS(app,
 app.config['SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-this')
 DATABASE_URL = os.getenv('DATABASE_URL')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-CHAINLIT_SERVER_URL = os.getenv('CHAINLIT_SERVER_URL', 'http://localhost:8000')
+CHAINLIT_SERVER_URL = os.getenv('CHAINLIT_SERVER_URL', 'http://localhost:8001')
 
-# Initialize OpenAI client (only for text processing, not embeddings)
+# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Initialize the static embedding model (runs 100x-400x faster on CPU)
+# Initialize the static embedding model
 print("🚀 Loading static embedding model...")
 try:
     embedding_model = SentenceTransformer('sentence-transformers/static-retrieval-mrl-en-v1')
@@ -45,121 +48,262 @@ except Exception as e:
     print(f"❌ Error loading embedding model: {e}")
     embedding_model = None
 
-# Database helper functions
-async def get_db_connection():
-    """Get database connection with error handling"""
-    try:
-        if not DATABASE_URL:
-            raise ValueError("DATABASE_URL not configured")
-        return await asyncpg.connect(DATABASE_URL)
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        raise
+# Global connection pool
+connection_pool = None
+pool_lock = asyncio.Lock()
 
-async def init_auth_tables():
-    """Initialize authentication tables if they don't exist"""
+# Global event loop
+app_loop = None
+
+async def init_connection_pool():
+    """Initialize database connection pool with proper error handling"""
+    global connection_pool
+    
+    async with pool_lock:  # Prevent multiple simultaneous initializations
+        if connection_pool is None:
+            try:
+                connection_pool = await asyncpg.create_pool(
+                    DATABASE_URL,
+                    min_size=2,
+                    max_size=20,
+                    max_queries=50000,
+                    max_inactive_connection_lifetime=300.0,
+                    command_timeout=60,
+                    statement_cache_size=0,  # Disable to prevent "another operation in progress" errors
+                    server_settings={'jit': 'off'}
+                )
+                print("✅ Database connection pool initialized")
+            except Exception as e:
+                print(f"❌ Failed to create database connection pool: {e}")
+                raise
+
+async def close_connection_pool():
+    """Properly close the connection pool"""
+    global connection_pool
+    
+    async with pool_lock:
+        if connection_pool:
+            try:
+                await connection_pool.close()
+                connection_pool = None
+                print("✅ Database connection pool closed")
+            except Exception as e:
+                print(f"Error closing pool: {e}")
+
+async def get_db_connection():
+    """Get database connection with proper error handling and retry logic"""
+    global connection_pool
+    
+    # Initialize pool if needed
+    if connection_pool is None:
+        await init_connection_pool()
+    
+    # Check if pool is closing or closed
+    if connection_pool._closing or connection_pool._closed:
+        connection_pool = None
+        await init_connection_pool()
+    
+    max_retries = 3
+    retry_delay = 1.0
+    
+    for attempt in range(max_retries):
+        try:
+            # Acquire connection with timeout
+            conn = await asyncio.wait_for(
+                connection_pool.acquire(),
+                timeout=15.0
+            )
+            
+            # Test the connection is actually working
+            await conn.fetchval('SELECT 1')
+            return conn
+            
+        except asyncio.TimeoutError:
+            print(f"Database connection timeout (attempt {attempt + 1}/{max_retries})")
+            if attempt == max_retries - 1:
+                raise Exception("Database connection timeout after all retries")
+            await asyncio.sleep(retry_delay)
+            
+        except asyncpg.exceptions.ConnectionDoesNotExistError as e:
+            print(f"Connection does not exist (attempt {attempt + 1}/{max_retries}): {e}")
+            # Try to release the bad connection
+            if 'conn' in locals():
+                try:
+                    await connection_pool.release(conn, timeout=1.0)
+                except:
+                    pass
+            
+            if attempt == max_retries - 1:
+                # Reinitialize pool on final attempt
+                connection_pool = None
+                await init_connection_pool()
+                raise Exception("Database connection failed after all retries")
+            await asyncio.sleep(retry_delay)
+            
+        except Exception as e:
+            print(f"Database connection error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(retry_delay)
+
+async def release_db_connection(conn):
+    """Release database connection with proper error handling"""
+    global connection_pool
+    
+    if not connection_pool or not conn:
+        return
+    
+    try:
+        # Check if connection is still valid
+        if conn.is_closed():
+            print("Attempting to release already closed connection")
+            return
+            
+        # Try to release the connection
+        await asyncio.wait_for(
+            connection_pool.release(conn),
+            timeout=5.0
+        )
+    except asyncio.TimeoutError:
+        print("Timeout releasing connection - terminating")
+        try:
+            await conn.close()
+        except:
+            pass
+    except asyncpg.exceptions.InterfaceError as e:
+        if "another operation is in progress" in str(e):
+            print("Connection busy - terminating")
+            try:
+                await conn.close()
+            except:
+                pass
+        else:
+            print(f"Interface error releasing connection: {e}")
+    except Exception as e:
+        print(f"Error releasing connection: {e}")
+        try:
+            await conn.close()
+        except:
+            pass
+
+@asynccontextmanager
+async def get_db_connection_context():
+    """Context manager for database connections - RECOMMENDED APPROACH"""
     conn = None
     try:
         conn = await get_db_connection()
-        
-        # Create companies table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS companies (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                code VARCHAR(255) UNIQUE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create users table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                email VARCHAR(255) UNIQUE NOT NULL,
-                password_hash VARCHAR(255) NOT NULL,
-                company_id INTEGER REFERENCES companies(id),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_active BOOLEAN DEFAULT TRUE
-            )
-        """)
-        
-        # Create chainlit_users table for Chainlit integration
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS chainlit_users (
-                id SERIAL PRIMARY KEY,
-                identifier VARCHAR(255) UNIQUE NOT NULL,
-                email VARCHAR(255),
-                company_id INTEGER REFERENCES companies(id),
-                metadata JSONB,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create user_sessions table for token management
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_sessions (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER REFERENCES users(id),
-                token_hash VARCHAR(255) NOT NULL,
-                expires_at TIMESTAMP NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create faq_data table if it doesn't exist
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS faq_data (
-                id SERIAL PRIMARY KEY,
-                company_id INTEGER REFERENCES companies(id),
-                question TEXT NOT NULL,
-                answer TEXT NOT NULL,
-                embedding FLOAT4[] NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create doc_data table if it doesn't exist
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS doc_data (
-                id SERIAL PRIMARY KEY,
-                company_id INTEGER REFERENCES companies(id),
-                doc_name VARCHAR(255),
-                doc_path VARCHAR(500),
-                doc_content TEXT,
-                doc_status VARCHAR(50) DEFAULT 'pending',
-                faq_count INTEGER DEFAULT 0,
-                file_size BIGINT DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Insert a default company if none exists
-        company_exists = await conn.fetchval("SELECT COUNT(*) FROM companies")
-        if company_exists == 0:
-            await conn.execute("""
-                INSERT INTO companies (name, code) VALUES 
-                ('Default Company', 'default'),
-                ('Test Company', 'test')
-            """)
-            print("✅ Default companies created")
-        
-        print("✅ Authentication tables initialized")
-    except Exception as e:
-        print(f"Error initializing tables: {e}")
-        raise
+        yield conn
     finally:
         if conn:
-            await conn.close()
+            await release_db_connection(conn)
+
+async def init_auth_tables():
+    """Initialize authentication tables if they don't exist"""
+    async with get_db_connection_context() as conn:
+        try:
+            # Create companies table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS companies (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    code VARCHAR(255) UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create users table (consistent naming)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    company_id INTEGER REFERENCES companies(id),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT TRUE
+                )
+            """)
+            
+            # Create faq_data table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS faq_data (
+                    id SERIAL PRIMARY KEY,
+                    company_id INTEGER REFERENCES companies(id),
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    embedding FLOAT8[] NULL,
+                    doc_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create doc_data table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS doc_data (
+                    id SERIAL PRIMARY KEY,
+                    company_id INTEGER REFERENCES companies(id),
+                    doc_name VARCHAR(255),
+                    doc_path VARCHAR(500),
+                    doc_content TEXT,
+                    doc_status VARCHAR(50) DEFAULT 'pending',
+                    faq_count INTEGER DEFAULT 0,
+                    file_size BIGINT DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create chat_sessions table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id SERIAL PRIMARY KEY,
+                    session_id VARCHAR(255) UNIQUE NOT NULL,
+                    user_id INTEGER REFERENCES users(id),
+                    company_id INTEGER REFERENCES companies(id),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create chat_messages table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id SERIAL PRIMARY KEY,
+                    session_id VARCHAR(255) NOT NULL,
+                    role VARCHAR(50) NOT NULL,
+                    message TEXT NOT NULL,
+                    message_type VARCHAR(50) DEFAULT 'user_message',
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create indexes
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_company_id ON faq_data(company_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_company_id ON doc_data(company_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_company_id ON chat_sessions(company_id)")
+            
+            # Insert default companies if none exist
+            company_exists = await conn.fetchval("SELECT COUNT(*) FROM companies")
+            if company_exists == 0:
+                await conn.execute("""
+                    INSERT INTO companies (name, code) VALUES 
+                    ('Default Company', 'default'),
+                    ('Demo Company', 'demo'),
+                    ('Test Company', 'test')
+                """)
+                print("✅ Default companies created")
+            
+            print("✅ Authentication tables initialized")
+        except Exception as e:
+            print(f"Error initializing tables: {e}")
+            raise
 
 def generate_token(user_id, company_id, email=None):
     """Generate JWT token with proper payload structure"""
     payload = {
-        'sub': user_id,  # Standard JWT subject
-        'user_id': user_id,  # For backward compatibility
-        'email': email,  # Include email in token
+        'sub': user_id,
+        'user_id': user_id,
+        'email': email,
         'company_id': company_id,
         'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24),
         'iat': datetime.datetime.utcnow(),
@@ -179,7 +323,6 @@ def verify_token(token):
         print(f"Invalid token: {e}")
         return None
 
-# Helper function to extract token from request
 def get_token_from_request():
     """Extract token from Authorization header or query parameter"""
     # Try Authorization header first
@@ -187,150 +330,85 @@ def get_token_from_request():
     if auth_header and auth_header.startswith('Bearer '):
         return auth_header[7:]
     
-    # Try query parameter (for Chainlit iframe)
+    # Try query parameter
     token = request.args.get('token')
     if token:
         return token
     
     return None
 
-# Utility function to run async code in sync context
-def run_async(coro):
-    """Helper to run async functions in Flask routes"""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If loop is already running, create a new thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, coro)
-                return future.result()
-        else:
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+# Flask async wrapper that handles event loop properly
+def async_flask(f):
+    """Decorator for async routes in Flask"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        global app_loop
+        # Use the global event loop
+        if app_loop is None or app_loop.is_closed():
+            app_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(app_loop)
+        
+        try:
+            return app_loop.run_until_complete(f(*args, **kwargs))
+        except Exception as e:
+            print(f"Error in async route: {e}")
+            raise
+    
+    return wrapper
 
 async def get_company_by_code(company_code):
     """Get company by code from database"""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        company = await conn.fetchrow("""
-            SELECT id, name, code FROM companies 
-            WHERE code = $1
-        """, company_code)
-        return dict(company) if company else None
-    except Exception as e:
-        print(f"Error getting company: {e}")
-        return None
-    finally:
-        if conn:
-            await conn.close()
+    async with get_db_connection_context() as conn:
+        try:
+            company = await conn.fetchrow("""
+                SELECT id, name, code FROM companies 
+                WHERE code = $1
+            """, company_code)
+            return dict(company) if company else None
+        except Exception as e:
+            print(f"Error getting company: {e}")
+            return None
 
 async def create_user(email, password_hash, company_id):
     """Create new user in database"""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        user_id = await conn.fetchval("""
-            INSERT INTO users (email, password_hash, company_id)
-            VALUES ($1, $2, $3) RETURNING id
-        """, email, password_hash, company_id)
-        return user_id
-    except Exception as e:
-        print(f"Error creating user: {e}")
-        raise
-    finally:
-        if conn:
-            await conn.close()
+    async with get_db_connection_context() as conn:
+        try:
+            user_id = await conn.fetchval("""
+                INSERT INTO users (email, password_hash, company_id)
+                VALUES ($1, $2, $3) RETURNING id
+            """, email, password_hash, company_id)
+            return user_id
+        except Exception as e:
+            print(f"Error creating user: {e}")
+            raise
 
 async def get_user_by_email(email):
     """Get user by email from database"""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        user = await conn.fetchrow("""
-            SELECT id, email, password_hash, company_id, is_active
-            FROM users WHERE email = $1
-        """, email)
-        return dict(user) if user else None
-    except Exception as e:
-        print(f"Error getting user: {e}")
-        return None
-    finally:
-        if conn:
-            await conn.close()
+    async with get_db_connection_context() as conn:
+        try:
+            user = await conn.fetchrow("""
+                SELECT id, email, password_hash, company_id, is_active
+                FROM users WHERE email = $1
+            """, email)
+            return dict(user) if user else None
+        except Exception as e:
+            print(f"Error getting user: {e}")
+            return None
 
 async def get_user_with_company(user_id):
     """Get user with company information"""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        user = await conn.fetchrow("""
-            SELECT u.id, u.email, u.company_id, c.name as company_name, c.code as company_code
-            FROM users u
-            JOIN companies c ON u.company_id = c.id
-            WHERE u.id = $1 AND u.is_active = true
-        """, user_id)
-        return dict(user) if user else None
-    except Exception as e:
-        print(f"Error getting user with company: {e}")
-        return None
-    finally:
-        if conn:
-            await conn.close()
-
-async def create_user_session(user_id, token):
-    """Create a new session record in user_sessions table"""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
-        await conn.execute("""
-            INSERT INTO user_sessions (user_id, token_hash, expires_at)
-            VALUES ($1, $2, $3)
-        """, user_id, token_hash, expires_at)
-    except Exception as e:
-        print(f"Error creating user session: {e}")
-    finally:
-        if conn:
-            await conn.close()
-
-async def create_chainlit_user(email, company_id, user_id):
-    """Create or update Chainlit user for seamless integration"""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        
-        # Get company info
-        company = await conn.fetchrow("SELECT name, code FROM companies WHERE id = $1", company_id)
-        
-        metadata = {
-            'email': email,
-            'company_id': company_id,
-            'company_name': company['name'] if company else 'Unknown',
-            'company_code': company['code'] if company else 'Unknown',
-            'user_id': user_id,
-            'embedding_model': 'static-retrieval-mrl-en-v1'
-        }
-        
-        # Delete old records for this identifier to avoid conflicts
-        await conn.execute("DELETE FROM chainlit_users WHERE identifier = $1", email)
-        
-        # Insert fresh record
-        await conn.execute("""
-            INSERT INTO chainlit_users (identifier, email, company_id, metadata, last_login)
-            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-        """, email, email, company_id, json.dumps(metadata))
-        
-        print(f"✅ Chainlit user created/updated: {email}")
-        
-    except Exception as e:
-        print(f"Error creating chainlit user: {e}")
-    finally:
-        if conn:
-            await conn.close()
+    async with get_db_connection_context() as conn:
+        try:
+            user = await conn.fetchrow("""
+                SELECT u.id, u.email, u.company_id, c.name as company_name, c.code as company_code
+                FROM users u
+                JOIN companies c ON u.company_id = c.id
+                WHERE u.id = $1 AND u.is_active = true
+            """, user_id)
+            return dict(user) if user else None
+        except Exception as e:
+            print(f"Error getting user with company: {e}")
+            return None
 
 def generate_static_embedding(text):
     """Generate embedding using sentence transformer model"""
@@ -348,16 +426,13 @@ def generate_static_embedding(text):
 
 async def search_faqs_by_embedding(query, company_id):
     """Search FAQs using embeddings and cosine similarity"""
-    try:
-        query_embedding = generate_static_embedding(query)
-        
-        if not query_embedding:
-            return None
-        
-        conn = None
+    async with get_db_connection_context() as conn:
         try:
-            conn = await get_db_connection()
-            # Get all FAQs for the company
+            query_embedding = generate_static_embedding(query)
+            
+            if not query_embedding:
+                return None
+            
             faqs = await conn.fetch("""
                 SELECT question, answer, embedding
                 FROM faq_data
@@ -367,7 +442,6 @@ async def search_faqs_by_embedding(query, company_id):
             if not faqs:
                 return None
             
-            # Calculate similarities
             similarities = []
             for faq in faqs:
                 if faq['embedding']:
@@ -385,12 +459,10 @@ async def search_faqs_by_embedding(query, company_id):
             if not similarities:
                 return None
             
-            # Sort by similarity and get the best match
             similarities.sort(key=lambda x: x[0], reverse=True)
             best_match = similarities[0]
             
-            # Return the best match if confidence is high enough
-            if best_match[0] >= 0.6:  # Lower threshold for better matches
+            if best_match[0] >= 0.6:
                 return {
                     'answer': best_match[1]['answer'],
                     'question': best_match[1]['question'],
@@ -405,207 +477,132 @@ async def search_faqs_by_embedding(query, company_id):
                     'source': 'system',
                     'embedding_type': 'static-retrieval-mrl-en-v1'
                 }
-                
-        finally:
-            if conn:
-                await conn.close()
-            
-    except Exception as e:
-        print(f"FAQ search error: {e}")
-        return None
-
-async def search_faqs_by_keywords(query, company_id):
-    """Fallback keyword-based search if embeddings fail"""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        # Simple keyword search in questions and answers
-        faqs = await conn.fetch("""
-            SELECT question, answer
-            FROM faq_data
-            WHERE company_id = $1 
-            AND (LOWER(question) LIKE $2 OR LOWER(answer) LIKE $2)
-            ORDER BY 
-                CASE WHEN LOWER(question) LIKE $2 THEN 1 ELSE 2 END,
-                LENGTH(question)
-            LIMIT 1
-        """, company_id, f'%{query.lower()}%')
-        
-        if faqs:
-            faq = faqs[0]
-            return {
-                'answer': faq['answer'],
-                'question': faq['question'],
-                'confidence': 0.7,
-                'source': 'faq',
-                'embedding_type': 'keyword_fallback'
-            }
-        return None
-        
-    except Exception as e:
-        print(f"Keyword search error: {e}")
-        return None
-    finally:
-        if conn:
-            await conn.close()
+                    
+        except Exception as e:
+            print(f"FAQ search error: {e}")
+            return None
 
 # ====== AUTHENTICATION ENDPOINTS ======
 
-@app.route('/auth/header', methods=['POST'])
-def auth_header():
-    """Chainlit authentication endpoint"""
+@app.route('/api/signup', methods=['POST'])
+@async_flask
+async def signup():
+    """Signup endpoint with proper connection handling"""
     try:
-        # Get token from Authorization header
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'Authorization header missing or invalid'}), 401
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        email = data.get('email')
+        password = data.get('password')
+        company_code = data.get('company_code', 'default')
         
-        token = auth_header[7:]  # Remove 'Bearer ' prefix
+        if not email or not password:
+            return jsonify({'error': 'Email and password are required'}), 400
         
-        # Verify token
-        payload = verify_token(token)
-        if not payload:
-            return jsonify({'error': 'Invalid or expired token'}), 401
+        print(f"🔍 Signup attempt for: {email} (Company: {company_code})")
         
-        # Get user with company information
-        user_info = run_async(get_user_with_company(payload['user_id']))
-        if not user_info:
-            return jsonify({'error': 'User not found'}), 404
+        # Check if company exists
+        company = await get_company_by_code(company_code)
+        if not company:
+            print(f"❌ Invalid company code: {company_code}")
+            return jsonify({'error': 'Invalid company code'}), 400
+        
+        # Check if user already exists
+        existing_user = await get_user_by_email(email)
+        if existing_user:
+            print(f"❌ User already exists: {email}")
+            return jsonify({'error': 'User already exists'}), 400
+        
+        # Create user
+        password_hash = generate_password_hash(password)
+        user_id = await create_user(email, password_hash, company['id'])
+        
+        print(f"✅ User created: {email} (ID: {user_id}, Company: {company['id']})")
+        
+        # Generate token with email included
+        token = generate_token(user_id, company['id'], email)
         
         return jsonify({
-            'authenticated': True,
-            'user': user_info,
+            'message': 'User created successfully',
+            'token': token,
+            'user': {
+                'id': user_id,
+                'email': email,
+                'company_id': company['id'],
+                'company_name': company['name'],
+                'company_code': company['code']
+            },
             'embedding_model': 'static-retrieval-mrl-en-v1',
-            'performance': '100x-400x faster on CPU',
-            'token': token
+            'chainlit_url': f"{CHAINLIT_SERVER_URL}?token={token}"
         })
         
     except Exception as e:
-        print(f"Auth header error: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-# Authentication endpoints (updated to use run_async)
-@app.route('/api/signup', methods=['POST'])
-def signup():
-    async def async_signup():
-        try:
-            data = request.get_json()
-            if not data:
-                return jsonify({'error': 'No data provided'}), 400
-                
-            email = data.get('email')
-            password = data.get('password')
-            company_code = data.get('company_code', 'default')
-            
-            if not email or not password:
-                return jsonify({'error': 'Email and password are required'}), 400
-            
-            print(f"🔍 Signup attempt for: {email} (Company: {company_code})")
-            
-            # Check if company exists
-            company = await get_company_by_code(company_code)
-            if not company:
-                print(f"❌ Invalid company code: {company_code}")
-                return jsonify({'error': 'Invalid company code'}), 400
-            
-            # Check if user already exists
-            existing_user = await get_user_by_email(email)
-            if existing_user:
-                print(f"❌ User already exists: {email}")
-                return jsonify({'error': 'User already exists'}), 400
-            
-            # Create user
-            password_hash = generate_password_hash(password)
-            user_id = await create_user(email, password_hash, company['id'])
-            
-            print(f"✅ User created: {email} (ID: {user_id}, Company: {company['id']})")
-            
-            # Create Chainlit user for seamless integration
-            await create_chainlit_user(email, company['id'], user_id)
-            
-            # Generate token with email included
-            token = generate_token(user_id, company['id'], email)
-            await create_user_session(user_id, token)
-            
-            return jsonify({
-                'message': 'User created successfully',
-                'token': token,
-                'user': {
-                    'id': user_id,
-                    'email': email,
-                    'company_id': company['id']
-                },
-                'embedding_model': 'static-retrieval-mrl-en-v1',
-                'performance': '100x-400x faster on CPU',
-                'chainlit_url': f"{CHAINLIT_SERVER_URL}?token={token}"
-            })
-            
-        except Exception as e:
-            print(f"Signup error: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({'error': str(e)}), 500
-    
-    return run_async(async_signup())
+        print(f"Signup error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/login', methods=['POST'])
-def login():
-    async def async_login():
-        try:
-            data = request.get_json()
-            if not data:
-                return jsonify({'error': 'No data provided'}), 400
-                
-            email = data.get('email')
-            password = data.get('password')
+@async_flask
+async def login():
+    """Login endpoint with proper connection handling"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
             
-            if not email or not password:
-                return jsonify({'error': 'Email and password are required'}), 400
-            
-            print(f"🔍 Login attempt for: {email}")
-            
-            # Get user
-            user = await get_user_by_email(email)
-            if not user or not user['is_active']:
-                print(f"❌ User not found or inactive: {email}")
-                return jsonify({'error': 'Invalid credentials'}), 401
-            
-            # Check password
-            if not check_password_hash(user['password_hash'], password):
-                print(f"❌ Invalid password for: {email}")
-                return jsonify({'error': 'Invalid credentials'}), 401
-            
-            print(f"✅ Login successful for: {email} (ID: {user['id']}, Company: {user['company_id']})")
-            
-            # Create/update Chainlit user for seamless integration
-            await create_chainlit_user(email, user['company_id'], user['id'])
-            
-            # Generate token with email included
-            token = generate_token(user['id'], user['company_id'], email)
-            await create_user_session(user['id'], token)
-            
-            return jsonify({
-                'message': 'Login successful',
-                'token': token,
-                'user': {
-                    'id': user['id'],
-                    'email': user['email'],  # Use the actual email from database
-                    'company_id': user['company_id']
-                },
-                'embedding_model': 'static-retrieval-mrl-en-v1',
-                'chainlit_url': f"{CHAINLIT_SERVER_URL}?token={token}"
-            })
-            
-        except Exception as e:
-            print(f"Login error: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({'error': str(e)}), 500
-    
-    return run_async(async_login())
+        email = data.get('email')
+        password = data.get('password')
+        
+        if not email or not password:
+            return jsonify({'error': 'Email and password are required'}), 400
+        
+        print(f"🔍 Login attempt for: {email}")
+        
+        # Get user
+        user = await get_user_by_email(email)
+        if not user or not user['is_active']:
+            print(f"❌ User not found or inactive: {email}")
+            return jsonify({'error': 'Invalid credentials'}), 401
+        
+        # Check password
+        if not check_password_hash(user['password_hash'], password):
+            print(f"❌ Invalid password for: {email}")
+            return jsonify({'error': 'Invalid credentials'}), 401
+        
+        # Get company info
+        async with get_db_connection_context() as conn:
+            company = await conn.fetchrow("SELECT name, code FROM companies WHERE id = $1", user['company_id'])
+            company = dict(company) if company else {'name': 'Unknown', 'code': 'unknown'}
+        
+        print(f"✅ Login successful for: {email} (ID: {user['id']}, Company: {user['company_id']})")
+        
+        # Generate token with email included
+        token = generate_token(user['id'], user['company_id'], email)
+        
+        return jsonify({
+            'message': 'Login successful',
+            'token': token,
+            'user': {
+                'id': user['id'],
+                'email': user['email'],
+                'company_id': user['company_id'],
+                'company_name': company['name'],
+                'company_code': company['code']
+            },
+            'embedding_model': 'static-retrieval-mrl-en-v1',
+            'chainlit_url': f"{CHAINLIT_SERVER_URL}?token={token}"
+        })
+        
+    except Exception as e:
+        print(f"Login error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/verify-token', methods=['GET'])
-def verify_token_route():
+@async_flask
+async def verify_token_route():
+    """Verify token endpoint with proper connection handling"""
     try:
         token = get_token_from_request()
         if not token:
@@ -615,12 +612,14 @@ def verify_token_route():
         if not payload:
             return jsonify({'error': 'Token is invalid or expired'}), 401
         
+        # Get fresh user info
+        user_info = await get_user_with_company(payload['user_id'])
+        if not user_info:
+            return jsonify({'error': 'User not found'}), 404
+        
         return jsonify({
             'valid': True,
-            'user': {
-                'id': payload['user_id'],
-                'company_id': payload['company_id']
-            },
+            'user': user_info,
             'embedding_model': 'static-retrieval-mrl-en-v1'
         })
         
@@ -628,163 +627,139 @@ def verify_token_route():
         print(f"Token verification error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
-# Enhanced endpoint for Chainlit authentication
 @app.route('/api/chainlit-auth', methods=['GET', 'POST'])
-def chainlit_auth():
-    async def async_chainlit_auth():
-        try:
-            # Get token from query parameter or Authorization header
-            token = get_token_from_request()
-            
-            if not token:
-                return jsonify({'error': 'Access token is required'}), 400
-            
-            # Verify token
-            payload = verify_token(token)
-            if not payload:
-                return jsonify({'error': 'Invalid or expired token'}), 401
-            
-            user_id = payload.get('user_id') or payload.get('sub')
-            user_email = payload.get('email')
-            
-            print(f"🔍 Chainlit auth for user_id: {user_id}, email: {user_email}")
-            
-            # Get fresh user info from database
-            user_info = await get_user_with_company(user_id)
-            if not user_info:
-                return jsonify({'error': 'User not found'}), 404
-            
-            # Use database email as source of truth
-            actual_email = user_info['email']
-            
-            print(f"✅ Chainlit auth successful: {actual_email} (Company: {user_info['company_id']})")
-            
-            return jsonify({
-                'authenticated': True,
-                'user': {
-                    'id': user_info['id'],
-                    'email': actual_email,  # Use actual email from database
-                    'company_id': user_info['company_id'],
-                    'company_name': user_info['company_name'],
-                    'company_code': user_info['company_code']
-                },
-                'embedding_model': 'static-retrieval-mrl-en-v1',
-                'performance': '100x-400x faster on CPU',
-                'token': token
-            })
-            
-        except Exception as e:
-            print(f"Chainlit auth error: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({'error': str(e)}), 500
-    
-    return run_async(async_chainlit_auth())
+@async_flask
+async def chainlit_auth():
+    """Chainlit auth endpoint with proper connection handling"""
+    try:
+        token = get_token_from_request()
+        
+        if not token:
+            return jsonify({'error': 'Access token is required'}), 400
+        
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({'error': 'Invalid or expired token'}), 401
+        
+        user_id = payload.get('user_id') or payload.get('sub')
+        user_email = payload.get('email')
+        
+        print(f"🔍 Chainlit auth for user_id: {user_id}, email: {user_email}")
+        
+        user_info = await get_user_with_company(user_id)
+        if not user_info:
+            return jsonify({'error': 'User not found'}), 404
+        
+        actual_email = user_info['email']
+        
+        print(f"✅ Chainlit auth successful: {actual_email} (Company: {user_info['company_id']})")
+        
+        return jsonify({
+            'authenticated': True,
+            'user': {
+                'id': user_info['id'],
+                'email': actual_email,
+                'company_id': user_info['company_id'],
+                'company_name': user_info['company_name'],
+                'company_code': user_info['company_code']
+            },
+            'embedding_model': 'static-retrieval-mrl-en-v1',
+            'token': token
+        })
+        
+    except Exception as e:
+        print(f"Chainlit auth error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/search', methods=['POST'])
-def search():
-    async def async_search():
-        try:
-            token = get_token_from_request()
-            if not token:
-                return jsonify({'error': 'Token is missing'}), 401
-                
-            payload = verify_token(token)
-            if not payload:
-                return jsonify({'error': 'Token is invalid or expired'}), 401
+@async_flask
+async def search():
+    """Search endpoint with proper connection handling"""
+    try:
+        token = get_token_from_request()
+        if not token:
+            return jsonify({'error': 'Token is missing'}), 401
             
-            data = request.get_json()
-            if not data:
-                return jsonify({'error': 'No data provided'}), 400
-                
-            query = data.get('query', '').strip()
-            if not query:
-                return jsonify({'error': 'Query is required'}), 400
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({'error': 'Token is invalid or expired'}), 401
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
             
-            # Try embedding-based search first
-            result = await search_faqs_by_embedding(query, payload['company_id'])
+        query = data.get('query', '').strip()
+        if not query:
+            return jsonify({'error': 'Query is required'}), 400
+        
+        result = await search_faqs_by_embedding(query, payload['company_id'])
+        
+        if result:
+            return jsonify(result)
+        else:
+            return jsonify({
+                'answer': "I couldn't find any relevant information for your question. Please try asking in a different way or contact your administrator.",
+                'source': 'system',
+                'confidence': 0.0,
+                'embedding_type': 'static-retrieval-mrl-en-v1'
+            })
             
-            # Fallback to keyword search if embedding search fails
-            if not result:
-                result = await search_faqs_by_keywords(query, payload['company_id'])
+    except Exception as e:
+        print(f"Search error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/company-stats', methods=['GET'])
+@async_flask
+async def company_stats():
+    """Company stats endpoint with proper connection handling"""
+    try:
+        token = get_token_from_request()
+        if not token:
+            return jsonify({'error': 'Token is missing'}), 401
             
-            if result:
-                return jsonify(result)
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({'error': 'Token is invalid or expired'}), 401
+        
+        async with get_db_connection_context() as conn:
+            stats = await conn.fetchrow("""
+                SELECT 
+                    c.name as company_name,
+                    COUNT(DISTINCT dd.id) as total_documents,
+                    COUNT(fd.id) as total_faqs,
+                    COUNT(DISTINCT dd.id) FILTER (WHERE dd.doc_status = 'completed') as completed_documents
+                FROM companies c
+                LEFT JOIN doc_data dd ON c.id = dd.company_id
+                LEFT JOIN faq_data fd ON c.id = fd.company_id
+                WHERE c.id = $1
+                GROUP BY c.id, c.name
+            """, payload['company_id'])
+            
+            if stats:
+                return jsonify({
+                    'company_name': stats['company_name'],
+                    'total_documents': stats['total_documents'] or 0,
+                    'total_faqs': stats['total_faqs'] or 0,
+                    'completed_documents': stats['completed_documents'] or 0,
+                    'embedding_model': 'static-retrieval-mrl-en-v1'
+                })
             else:
                 return jsonify({
-                    'answer': "I couldn't find any relevant information for your question. Please try asking in a different way or contact your administrator.",
-                    'source': 'system',
-                    'confidence': 0.0,
-                    'embedding_type': 'static-retrieval-mrl-en-v1'
+                    'company_name': 'Unknown',
+                    'total_documents': 0,
+                    'total_faqs': 0,
+                    'completed_documents': 0,
+                    'embedding_model': 'static-retrieval-mrl-en-v1'
                 })
                 
-        except Exception as e:
-            print(f"Search error: {e}")
-            return jsonify({'error': str(e)}), 500
-    
-    return run_async(async_search())
+    except Exception as e:
+        print(f"Stats error: {e}")
+        return jsonify({'error': str(e)}), 500
 
-# Get company statistics
-@app.route('/api/company-stats', methods=['GET'])
-def company_stats():
-    async def async_stats():
-        try:
-            token = get_token_from_request()
-            if not token:
-                return jsonify({'error': 'Token is missing'}), 401
-                
-            payload = verify_token(token)
-            if not payload:
-                return jsonify({'error': 'Token is invalid or expired'}), 401
-            
-            conn = None
-            try:
-                conn = await get_db_connection()
-                # Get company stats
-                stats = await conn.fetchrow("""
-                    SELECT 
-                        c.name as company_name,
-                        COUNT(DISTINCT dd.id) as total_documents,
-                        COUNT(fd.id) as total_faqs,
-                        COUNT(DISTINCT dd.id) FILTER (WHERE dd.doc_status = 'completed') as completed_documents
-                    FROM companies c
-                    LEFT JOIN doc_data dd ON c.id = dd.company_id
-                    LEFT JOIN faq_data fd ON c.id = fd.company_id
-                    WHERE c.id = $1
-                    GROUP BY c.id, c.name
-                """, payload['company_id'])
-                
-                if stats:
-                    return jsonify({
-                        'company_name': stats['company_name'],
-                        'total_documents': stats['total_documents'] or 0,
-                        'total_faqs': stats['total_faqs'] or 0,
-                        'completed_documents': stats['completed_documents'] or 0,
-                        'embedding_model': 'static-retrieval-mrl-en-v1'
-                    })
-                else:
-                    return jsonify({
-                        'company_name': 'Unknown',
-                        'total_documents': 0,
-                        'total_faqs': 0,
-                        'completed_documents': 0,
-                        'embedding_model': 'static-retrieval-mrl-en-v1',
-                        'performance': '100x-400x faster on CPU'
-                    })
-                    
-            finally:
-                if conn:
-                    await conn.close()
-                
-        except Exception as e:
-            print(f"Stats error: {e}")
-            return jsonify({'error': str(e)}), 500
-    
-    return run_async(async_stats())
-
-# New endpoint to get embedding model info
 @app.route('/api/embedding-info', methods=['GET'])
 def embedding_info():
+    """Return information about the embedding model"""
     return jsonify({
         'model': 'static-retrieval-mrl-en-v1',
         'type': 'sentence-transformers',
@@ -799,28 +774,10 @@ def embedding_info():
         'status': 'loaded' if embedding_model else 'error'
     })
 
-# Add a test route for debugging
-@app.route('/api/test-auth', methods=['GET'])
-def test_auth():
-    async def async_test_auth():
-        try:
-            token = get_token_from_request()
-            if not token:
-                return jsonify({'error': 'No token provided', 'headers': dict(request.headers), 'args': dict(request.args)}), 401
-            
-            payload = verify_token(token)
-            if not payload:
-                return jsonify({'error': 'Invalid token', 'token': token[:20] + '...'}), 401
-            
-            return jsonify({'success': True, 'payload': payload})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    return run_async(async_test_auth())
-
-# Serve the HTML file
+# Serve static files
 @app.route('/')
 def serve_html():
+    """Serve the main HTML file"""
     try:
         return send_from_directory('.', 'index.html')
     except Exception as e:
@@ -829,6 +786,7 @@ def serve_html():
 
 @app.route('/<path:filename>')
 def serve_static(filename):
+    """Serve static files"""
     try:
         return send_from_directory('.', filename)
     except Exception as e:
@@ -838,16 +796,35 @@ def serve_static(filename):
 # Error handlers
 @app.errorhandler(404)
 def not_found(error):
+    """Handle 404 errors"""
     return jsonify({'error': 'Not found'}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
+    """Handle 500 errors"""
     return jsonify({'error': 'Internal server error'}), 500
 
+# Cleanup function for application shutdown
+async def cleanup():
+    """Clean up resources on shutdown"""
+    await close_connection_pool()
+    
+    # Clean up any pending tasks
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 if __name__ == '__main__':
+    # Initialize global event loop
+    app_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(app_loop)
+    
     # Initialize auth tables
     try:
-        asyncio.run(init_auth_tables())
+        app_loop.run_until_complete(init_auth_tables())
         print("✅ Database tables initialized")
     except Exception as e:
         print(f"❌ Database initialization error: {e}")
@@ -861,4 +838,10 @@ if __name__ == '__main__':
     print(f"🔗 Chainlit: {CHAINLIT_SERVER_URL}")
     print("🔐 Authentication system ready!")
     
-    app.run(debug=True, port=5000, host='0.0.0.0')
+    try:
+        app.run(debug=True, port=5000, host='0.0.0.0')
+    finally:
+        # Ensure cleanup on shutdown
+        app_loop.run_until_complete(cleanup())
+        if not app_loop.is_closed():
+            app_loop.close()
