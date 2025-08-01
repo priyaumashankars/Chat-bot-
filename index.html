@@ -6,14 +6,12 @@
     <title>FAQ Assistant</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
     <style>
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
-
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
                 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
@@ -23,7 +21,6 @@
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
         }
-
         .loading-container {
             display: flex;
             flex-direction: column;
@@ -32,7 +29,6 @@
             height: 100vh;
             color: white;
         }
-
         .loading-spinner {
             width: 40px;
             height: 40px;
@@ -42,12 +38,10 @@
             animation: spin 1s linear infinite;
             margin-bottom: 20px;
         }
-
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-
         .auth-container {
             display: flex;
             justify-content: center;
@@ -55,7 +49,6 @@
             min-height: 100vh;
             padding: 20px;
         }
-
         .auth-card {
             background: white;
             padding: 40px;
@@ -64,7 +57,6 @@
             width: 100%;
             max-width: 400px;
         }
-
         .auth-card h2 {
             text-align: center;
             margin-bottom: 8px;
@@ -72,17 +64,14 @@
             font-size: 24px;
             font-weight: 700;
         }
-
         .auth-card > p {
             text-align: center;
             color: #6b7280;
             margin-bottom: 32px;
         }
-
         .form-group {
             margin-bottom: 20px;
         }
-
         .form-group label {
             display: block;
             margin-bottom: 6px;
@@ -90,7 +79,6 @@
             font-weight: 500;
             font-size: 14px;
         }
-
         .form-group input {
             width: 100%;
             padding: 12px 16px;
@@ -99,13 +87,11 @@
             font-size: 16px;
             transition: border-color 0.2s, box-shadow 0.2s;
         }
-
         .form-group input:focus {
             outline: none;
             border-color: #667eea;
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
-
         .error-message {
             background: #fef2f2;
             color: #dc2626;
@@ -115,7 +101,6 @@
             font-size: 14px;
             border: 1px solid #fecaca;
         }
-
         .auth-button {
             width: 100%;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -128,23 +113,19 @@
             cursor: pointer;
             transition: transform 0.2s, box-shadow 0.2s;
         }
-
         .auth-button:hover:not(:disabled) {
             transform: translateY(-1px);
             box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
         }
-
         .auth-button:disabled {
             opacity: 0.6;
             cursor: not-allowed;
         }
-
         .auth-switch {
             text-align: center;
             margin-top: 24px;
             color: #6b7280;
         }
-
         .link-button {
             background: none;
             border: none;
@@ -153,11 +134,9 @@
             cursor: pointer;
             text-decoration: underline;
         }
-
         .link-button:hover {
             color: #5a67d8;
         }
-
         .chat-container {
             display: flex;
             flex-direction: column;
@@ -166,7 +145,6 @@
             margin: 0 auto;
             background: white;
         }
-
         .chat-header {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
@@ -177,19 +155,16 @@
             position: relative;
             z-index: 1000;
         }
-
         .chat-header h1 {
             font-size: 24px;
             font-weight: 700;
         }
-
         .user-info {
             display: flex;
             align-items: center;
             gap: 16px;
             font-size: 14px;
         }
-
         .logout-button {
             background: rgba(255, 255, 255, 0.2);
             color: white;
@@ -200,11 +175,9 @@
             font-size: 14px;
             transition: background-color 0.2s;
         }
-
         .logout-button:hover {
             background: rgba(255, 255, 255, 0.3);
         }
-
         .copilot-container {
             flex: 1;
             position: relative;
@@ -212,7 +185,6 @@
             height: calc(100vh - 80px);
             overflow: hidden;
         }
-
         .copilot-button {
             position: fixed;
             bottom: 20px;
@@ -228,12 +200,10 @@
             transition: transform 0.2s, box-shadow 0.2s;
             box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
         }
-
         .copilot-button:hover {
             transform: translateY(-2px);
             box-shadow: 0 8px 25px rgba(102, 126, 234, 0.5);
         }
-
         .copilot-iframe {
             position: fixed;
             bottom: 20px;
@@ -247,7 +217,6 @@
             z-index: 1000;
             background: white;
         }
-
         .copilot-loading {
             display: flex;
             flex-direction: column;
@@ -259,7 +228,6 @@
             padding: 20px;
             border-radius: 12px;
         }
-
         .copilot-loading .spinner {
             width: 32px;
             height: 32px;
@@ -269,12 +237,10 @@
             animation: spin 1s linear infinite;
             margin-bottom: 16px;
         }
-
         .copilot-loading p {
             color: #6b7280;
             font-size: 14px;
         }
-
         .copilot-error {
             display: flex;
             flex-direction: column;
@@ -286,17 +252,14 @@
             padding: 20px;
             border-radius: 12px;
         }
-
         .copilot-error h3 {
             margin-bottom: 8px;
             color: #dc2626;
         }
-
         .copilot-error p {
             margin-bottom: 16px;
             color: #6b7280;
         }
-
         .retry-button {
             background: #667eea;
             color: white;
@@ -306,11 +269,9 @@
             cursor: pointer;
             font-size: 14px;
         }
-
         .retry-button:hover {
             background: #5a67d8;
         }
-
         .main-content {
             flex: 1;
             display: flex;
@@ -320,24 +281,20 @@
             padding: 40px 20px;
             text-align: center;
         }
-
         .welcome-section {
             max-width: 600px;
             margin-bottom: 40px;
         }
-
         .welcome-section h2 {
             font-size: 32px;
             color: #1f2937;
             margin-bottom: 16px;
         }
-
         .welcome-section p {
             font-size: 18px;
             color: #6b7280;
             margin-bottom: 32px;
         }
-
         .features-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -345,7 +302,6 @@
             max-width: 800px;
             margin: 0 auto;
         }
-
         .feature-card {
             background: white;
             padding: 24px;
@@ -353,7 +309,6 @@
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
             text-align: left;
         }
-
         .feature-card h3 {
             font-size: 18px;
             color: #1f2937;
@@ -362,12 +317,10 @@
             align-items: center;
             gap: 8px;
         }
-
         .feature-card p {
             color: #6b7280;
             font-size: 14px;
         }
-
         .admin-links {
             margin-top: 40px;
             display: flex;
@@ -375,7 +328,6 @@
             flex-wrap: wrap;
             justify-content: center;
         }
-
         .admin-link {
             display: inline-flex;
             align-items: center;
@@ -389,7 +341,6 @@
             transition: all 0.2s;
             border: 2px solid rgba(102, 126, 234, 0.2);
         }
-
         .admin-link:hover {
             background: white;
             color: #5a67d8;
@@ -397,26 +348,21 @@
             transform: translateY(-1px);
             box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
         }
-
         @media (max-width: 768px) {
             .chat-header {
                 padding: 16px;
             }
-            
             .chat-header h1 {
                 font-size: 20px;
             }
-            
             .user-info {
                 flex-direction: column;
                 gap: 8px;
                 font-size: 12px;
             }
-
             .copilot-container {
                 height: calc(100vh - 70px);
             }
-
             .copilot-iframe {
                 width: calc(100vw - 40px);
                 height: calc(100vh - 120px);
@@ -424,51 +370,41 @@
                 right: 10px;
                 left: 10px;
             }
-
             .copilot-button {
                 bottom: 10px;
                 right: 10px;
             }
-
             .welcome-section h2 {
                 font-size: 24px;
             }
-
             .welcome-section p {
                 font-size: 16px;
             }
-
             .features-grid {
                 grid-template-columns: 1fr;
             }
-
             .admin-links {
                 flex-direction: column;
                 align-items: center;
             }
         }
-
         @media (max-width: 480px) {
             .auth-card {
                 margin: 10px;
                 padding: 24px 16px;
             }
-
             .main-content {
                 padding: 20px 16px;
             }
-
             .welcome-section h2 {
                 font-size: 20px;
             }
         }
-
         @keyframes pulse {
             0% { box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4); }
             50% { box-shadow: 0 6px 25px rgba(102, 126, 234, 0.6); }
             100% { box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4); }
         }
-
         .copilot-button.pulse {
             animation: pulse 2s infinite;
         }
@@ -476,59 +412,84 @@
 </head>
 <body>
     <div id="root"></div>
-
-    <script type="text/babel">
-        const { useState, useEffect, createContext, useContext, useRef } = React;
-
+    <script>
+        const { useState, useEffect, createContext, useContext, useRef, createElement: e } = React;
+        
         // Auth Context
         const AuthContext = createContext();
-
+        
+        // API Configuration
+        const API_BASE_URL = 'http://localhost:5000';
+        const CHAINLIT_URL = 'http://localhost:8001';
+        
         // Auth Provider Component
         const AuthProvider = ({ children }) => {
             const [user, setUser] = useState(null);
             const [loading, setLoading] = useState(true);
-
+            
+            const verifyToken = async (token) => {
+                try {
+                    console.log('Verifying token:', token.substring(0, 20) + '...');
+                    
+                    const response = await fetch(`${API_BASE_URL}/api/verify-token`, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${token}`,
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    console.log('Verify response status:', response.status);
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        console.log('Token verification successful:', data);
+                        setUser(data.user || data);
+                        return true;
+                    } else {
+                        const errorText = await response.text();
+                        console.log('Token verification failed:', response.status, errorText);
+                        localStorage.removeItem('token');
+                        setUser(null);
+                        return false;
+                    }
+                } catch (error) {
+                    console.error('Token verification error:', error);
+                    localStorage.removeItem('token');
+                    setUser(null);
+                    return false;
+                } finally {
+                    setLoading(false);
+                }
+            };
+            
             useEffect(() => {
                 const token = localStorage.getItem('token');
+                console.log('Token from localStorage:', token ? 'Found' : 'Not found');
                 if (token) {
                     verifyToken(token);
                 } else {
                     setLoading(false);
                 }
             }, []);
-
-            const verifyToken = async (token) => {
-                try {
-                    const response = await fetch('http://localhost:5000/api/verify-token', {
-                        headers: {
-                            'Authorization': `Bearer ${token}`
-                        }
-                    });
-                    if (response.ok) {
-                        const data = await response.json();
-                        setUser(data.user);
-                    } else {
-                        localStorage.removeItem('token');
-                    }
-                } catch (error) {
-                    console.error('Token verification error:', error);
-                    localStorage.removeItem('token');
-                }
-                setLoading(false);
-            };
-
+            
             const login = async (email, password) => {
                 try {
-                    const response = await fetch('http://localhost:5000/api/login', {
+                    console.log('Attempting login for:', email);
+                    
+                    const response = await fetch(`${API_BASE_URL}/api/login`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
                         },
                         body: JSON.stringify({ email, password })
                     });
-
+                    
+                    console.log('Login response status:', response.status);
+                    
                     if (!response.ok) {
                         const errorData = await response.text();
+                        console.log('Login error:', errorData);
                         try {
                             const jsonError = JSON.parse(errorData);
                             return { success: false, error: jsonError.error || 'Login failed' };
@@ -536,29 +497,43 @@
                             return { success: false, error: `Server error: ${response.status}` };
                         }
                     }
-
+                    
                     const data = await response.json();
+                    console.log('Login successful:', data);
+                    
                     localStorage.setItem('token', data.token);
                     setUser(data.user);
                     return { success: true };
                 } catch (error) {
                     console.error('Login error:', error);
-                    return { success: false, error: 'Network error. Please check if the server is running on port 5000.' };
+                    return { 
+                        success: false, 
+                        error: 'Network error. Please check if the server is running on port 5000.' 
+                    };
                 }
             };
-
+            
             const signup = async (email, password, companyCode) => {
                 try {
-                    const response = await fetch('http://localhost:5000/api/signup', {
+                    console.log('Attempting signup for:', email, 'with company code:', companyCode);
+                    
+                    const response = await fetch(`${API_BASE_URL}/api/signup`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
                         },
-                        body: JSON.stringify({ email, password, company_code: companyCode })
+                        body: JSON.stringify({ 
+                            email, 
+                            password, 
+                            company_code: companyCode 
+                        })
                     });
-
+                    
+                    console.log('Signup response status:', response.status);
+                    
                     if (!response.ok) {
                         const errorData = await response.text();
+                        console.log('Signup error:', errorData);
                         try {
                             const jsonError = JSON.parse(errorData);
                             return { success: false, error: jsonError.error || 'Signup failed' };
@@ -566,28 +541,33 @@
                             return { success: false, error: `Server error: ${response.status}` };
                         }
                     }
-
+                    
                     const data = await response.json();
+                    console.log('Signup successful:', data);
+                    
                     localStorage.setItem('token', data.token);
                     setUser(data.user);
                     return { success: true };
                 } catch (error) {
                     console.error('Signup error:', error);
-                    return { success: false, error: 'Network error. Please check if the server is running on port 5000.' };
+                    return { 
+                        success: false, 
+                        error: 'Network error. Please check if the server is running on port 5000.' 
+                    };
                 }
             };
-
+            
             const logout = () => {
                 localStorage.removeItem('token');
                 setUser(null);
             };
-
-            return React.createElement(AuthContext.Provider, 
+            
+            return e(AuthContext.Provider, 
                 { value: { user, login, signup, logout, loading } },
                 children
             );
         };
-
+        
         // Login Component
         const LoginPage = ({ onSwitchToSignup }) => {
             const [email, setEmail] = useState('');
@@ -595,28 +575,26 @@
             const [error, setError] = useState('');
             const [loading, setLoading] = useState(false);
             const { login } = useContext(AuthContext);
-
+            
             const handleSubmit = async (e) => {
                 e.preventDefault();
                 setLoading(true);
                 setError('');
-
                 const result = await login(email, password);
                 if (!result.success) {
                     setError(result.error);
                 }
                 setLoading(false);
             };
-
-            return React.createElement('div', { className: 'auth-container' },
-                React.createElement('div', { className: 'auth-card' },
-                    React.createElement('h2', null, 'Welcome Back'),
-                    React.createElement('p', null, 'Sign in to access your FAQ assistant'),
-                    
-                    React.createElement('form', { onSubmit: handleSubmit },
-                        React.createElement('div', { className: 'form-group' },
-                            React.createElement('label', null, 'Email'),
-                            React.createElement('input', {
+            
+            return e('div', { className: 'auth-container' },
+                e('div', { className: 'auth-card' },
+                    e('h2', null, 'Welcome Back'),
+                    e('p', null, 'Sign in to access your FAQ assistant'),
+                    e('form', { onSubmit: handleSubmit },
+                        e('div', { className: 'form-group' },
+                            e('label', null, 'Email'),
+                            e('input', {
                                 type: 'email',
                                 value: email,
                                 onChange: (e) => setEmail(e.target.value),
@@ -624,10 +602,9 @@
                                 placeholder: 'Enter your email'
                             })
                         ),
-                        
-                        React.createElement('div', { className: 'form-group' },
-                            React.createElement('label', null, 'Password'),
-                            React.createElement('input', {
+                        e('div', { className: 'form-group' },
+                            e('label', null, 'Password'),
+                            e('input', {
                                 type: 'password',
                                 value: password,
                                 onChange: (e) => setPassword(e.target.value),
@@ -635,19 +612,16 @@
                                 placeholder: 'Enter your password'
                             })
                         ),
-                        
-                        error && React.createElement('div', { className: 'error-message' }, error),
-                        
-                        React.createElement('button', {
+                        error && e('div', { className: 'error-message' }, error),
+                        e('button', {
                             type: 'submit',
                             disabled: loading,
                             className: 'auth-button'
                         }, loading ? 'Signing in...' : 'Sign In')
                     ),
-                    
-                    React.createElement('p', { className: 'auth-switch' },
+                    e('p', { className: 'auth-switch' },
                         "Don't have an account? ",
-                        React.createElement('button', {
+                        e('button', {
                             onClick: onSwitchToSignup,
                             className: 'link-button'
                         }, 'Sign up here')
@@ -655,7 +629,7 @@
                 )
             );
         };
-
+        
         // Signup Component
         const SignupPage = ({ onSwitchToLogin }) => {
             const [email, setEmail] = useState('');
@@ -664,28 +638,26 @@
             const [error, setError] = useState('');
             const [loading, setLoading] = useState(false);
             const { signup } = useContext(AuthContext);
-
+            
             const handleSubmit = async (e) => {
                 e.preventDefault();
                 setLoading(true);
                 setError('');
-
                 const result = await signup(email, password, companyCode);
                 if (!result.success) {
                     setError(result.error);
                 }
                 setLoading(false);
             };
-
-            return React.createElement('div', { className: 'auth-container' },
-                React.createElement('div', { className: 'auth-card' },
-                    React.createElement('h2', null, 'Create Account'),
-                    React.createElement('p', null, 'Join your company\'s FAQ assistant'),
-                    
-                    React.createElement('form', { onSubmit: handleSubmit },
-                        React.createElement('div', { className: 'form-group' },
-                            React.createElement('label', null, 'Email'),
-                            React.createElement('input', {
+            
+            return e('div', { className: 'auth-container' },
+                e('div', { className: 'auth-card' },
+                    e('h2', null, 'Create Account'),
+                    e('p', null, 'Join your company\'s FAQ assistant'),
+                    e('form', { onSubmit: handleSubmit },
+                        e('div', { className: 'form-group' },
+                            e('label', null, 'Email'),
+                            e('input', {
                                 type: 'email',
                                 value: email,
                                 onChange: (e) => setEmail(e.target.value),
@@ -693,10 +665,9 @@
                                 placeholder: 'Enter your email'
                             })
                         ),
-                        
-                        React.createElement('div', { className: 'form-group' },
-                            React.createElement('label', null, 'Password'),
-                            React.createElement('input', {
+                        e('div', { className: 'form-group' },
+                            e('label', null, 'Password'),
+                            e('input', {
                                 type: 'password',
                                 value: password,
                                 onChange: (e) => setPassword(e.target.value),
@@ -704,10 +675,9 @@
                                 placeholder: 'Create a password'
                             })
                         ),
-                        
-                        React.createElement('div', { className: 'form-group' },
-                            React.createElement('label', null, 'Company Code'),
-                            React.createElement('input', {
+                        e('div', { className: 'form-group' },
+                            e('label', null, 'Company Code'),
+                            e('input', {
                                 type: 'text',
                                 value: companyCode,
                                 onChange: (e) => setCompanyCode(e.target.value),
@@ -715,19 +685,16 @@
                                 placeholder: 'Enter company code (default, demo, test)'
                             })
                         ),
-                        
-                        error && React.createElement('div', { className: 'error-message' }, error),
-                        
-                        React.createElement('button', {
+                        error && e('div', { className: 'error-message' }, error),
+                        e('button', {
                             type: 'submit',
                             disabled: loading,
                             className: 'auth-button'
                         }, loading ? 'Creating account...' : 'Sign Up')
                     ),
-                    
-                    React.createElement('p', { className: 'auth-switch' },
+                    e('p', { className: 'auth-switch' },
                         'Already have an account? ',
-                        React.createElement('button', {
+                        e('button', {
                             onClick: onSwitchToLogin,
                             className: 'link-button'
                         }, 'Sign in here')
@@ -735,7 +702,7 @@
                 )
             );
         };
-
+        
         // Chat Component with Chainlit Copilot
         const ChatPage = () => {
             const [copilotOpen, setCopilotOpen] = useState(false);
@@ -744,7 +711,7 @@
             const token = localStorage.getItem('token');
             const [copilotError, setCopilotError] = useState(null);
             const [copilotLoading, setCopilotLoading] = useState(false);
-
+            
             const toggleCopilot = () => {
                 if (!copilotOpen) {
                     setCopilotLoading(true);
@@ -752,7 +719,7 @@
                 }
                 setCopilotOpen(!copilotOpen);
             };
-
+            
             // Auto-open copilot after 3 seconds
             useEffect(() => {
                 const timer = setTimeout(() => {
@@ -763,88 +730,119 @@
                 }, 3000);
                 return () => clearTimeout(timer);
             }, [copilotOpen, user]);
-
+            
             // Monitor iframe load status
-            useEffect(() => {
-                if (copilotRef.current && user && token && copilotOpen) {
-                    const iframe = copilotRef.current;
-                    const chainlitUrl = `http://localhost:8001?token=${encodeURIComponent(token)}`;
+            // In the ChatPage component, update the useEffect for iframe loading:
+useEffect(() => {
+    if (copilotRef.current && user && token && copilotOpen) {
+        const loadChainlit = () => {
+            try {
+                console.log('Loading Chainlit with token');
+                const chainlitUrl = `${CHAINLIT_URL}`;
+                const iframe = copilotRef.current;
+                
+                // Set the source
+                iframe.src = chainlitUrl;
+                
+                const handleLoad = () => {
+                    console.log('Chainlit iframe loaded successfully');
+                    setCopilotLoading(false);
+                    setCopilotError(null);
                     
-                    iframe.src = chainlitUrl;
-
-                    const handleLoad = () => {
+                    // Try to communicate with the iframe to pass the token
+                    try {
+                        setTimeout(() => {
+                            console.log('Sending token to Chainlit iframe');
+                            iframe.contentWindow.postMessage({
+                                type: 'auth_token',
+                                token: token,
+                                user: user
+                            }, CHAINLIT_URL);
+                        }, 2000); // Increased delay
+                    } catch (e) {
+                        console.log('Could not post message to iframe:', e);
+                    }
+                };
+                
+                const handleError = () => {
+                    console.error('Chainlit iframe failed to load');
+                    setCopilotLoading(false);
+                    setCopilotError('Failed to load Chainlit. Please ensure the Chainlit server is running on port 8001.');
+                };
+                
+                iframe.addEventListener('load', handleLoad);
+                iframe.addEventListener('error', handleError);
+                
+                // Set a timeout to catch loading issues
+                const loadTimeout = setTimeout(() => {
+                    console.log('Checking loading status after 15 seconds');
+                    if (copilotLoading) {
+                        console.log('Still loading, checking iframe content');
                         setCopilotLoading(false);
-                        setCopilotError(null);
-                    };
-
-                    const handleError = () => {
-                        setCopilotLoading(false);
-                        setCopilotError('Failed to load Chainlit. Please ensure the Chainlit server is running on port 8001.');
-                    };
-
-                    iframe.addEventListener('load', handleLoad);
-                    iframe.addEventListener('error', handleError);
-
-                    // Set a timeout to catch loading issues
-                    const loadTimeout = setTimeout(() => {
-                        if (copilotLoading) {
-                            setCopilotLoading(false);
-                            setCopilotError('Chainlit is taking too long to load. Please check if the server is running.');
-                        }
-                    }, 10000);
-
-                    return () => {
-                        iframe.removeEventListener('load', handleLoad);
-                        iframe.removeEventListener('error', handleError);
-                        clearTimeout(loadTimeout);
-                    };
-                }
-            }, [copilotOpen, user, token, copilotLoading]);
-
+                        setCopilotError('Chainlit is taking too long to load. Please check if the server is running.');
+                    }
+                }, 15000);
+                
+                return () => {
+                    iframe.removeEventListener('load', handleLoad);
+                    iframe.removeEventListener('error', handleError);
+                    clearTimeout(loadTimeout);
+                };
+            } catch (error) {
+                console.error('Error loading Chainlit:', error);
+                setCopilotError('Error loading Chainlit. Please check your connection.');
+                setCopilotLoading(false);
+            }
+        };
+        
+        loadChainlit();
+    }
+}, [copilotOpen, user, token]);
+            
             if (!user) {
-                return React.createElement('div', { className: 'chat-container' },
-                    React.createElement('div', { className: 'chat-header' },
-                        React.createElement('h1', null, 'FAQ Assistant'),
-                        React.createElement('div', { className: 'user-info' },
-                            React.createElement('span', null, 'Not logged in')
+                return e('div', { className: 'chat-container' },
+                    e('div', { className: 'chat-header' },
+                        e('h1', null, 'FAQ Assistant'),
+                        e('div', { className: 'user-info' },
+                            e('span', null, 'Not logged in')
                         )
                     ),
-                    React.createElement('div', { className: 'main-content' },
-                        React.createElement('div', { className: 'welcome-section' },
-                            React.createElement('h2', null, 'Welcome to FAQ Assistant'),
-                            React.createElement('p', null, 'Your intelligent document and policy assistant powered by ultra-fast static embeddings'),
-                            React.createElement('div', { className: 'features-grid' },
-                                React.createElement('div', { className: 'feature-card' },
-                                    React.createElement('h3', null, '🚀 Ultra-Fast Search'),
-                                    React.createElement('p', null, 'Powered by static-retrieval-mrl-en-v1 model - 100x-400x faster on CPU')
+                    e('div', { className: 'main-content' },
+                        e('div', { className: 'welcome-section' },
+                            e('h2', null, 'Welcome to FAQ Assistant'),
+                            e('p', null, 'Your intelligent document and policy assistant powered by ultra-fast static embeddings'),
+                            e('div', { className: 'features-grid' },
+                                e('div', { className: 'feature-card' },
+                                    e('h3', null, '🚀 Ultra-Fast Search'),
+                                    e('p', null, 'Powered by static-retrieval-mrl-en-v1 model - 100x-400x faster on CPU')
                                 ),
-                                React.createElement('div', { className: 'feature-card' },
-                                    React.createElement('h3', null, '💬 Smart Chat Interface'),
-                                    React.createElement('p', null, 'Chainlit-powered chat interface with real-time FAQ matching')
+                                e('div', { className: 'feature-card' },
+                                    e('h3', null, '💬 Smart Chat Interface'),
+                                    e('p', null, 'Chainlit-powered chat interface with real-time FAQ matching')
                                 ),
-                                React.createElement('div', { className: 'feature-card' },
-                                    React.createElement('h3', null, '📚 Document Processing'),
-                                    React.createElement('p', null, 'Automatic PDF processing and FAQ generation from your documents')
+                                e('div', { className: 'feature-card' },
+                                    e('h3', null, '📚 Document Processing'),
+                                    e('p', null, 'Automatic PDF processing and FAQ generation from your documents')
                                 ),
-                                React.createElement('div', { className: 'feature-card' },
-                                    React.createElement('h3', null, '🏢 Multi-Company Support'),
-                                    React.createElement('p', null, 'Secure, company-specific knowledge bases with role-based access')
+                                e('div', { className: 'feature-card' },
+                                    e('h3', null, '🏢 Multi-Company Support'),
+                                    e('p', null, 'Secure, company-specific knowledge bases with role-based access')
                                 )
                             )
                         ),
-                        React.createElement('div', { className: 'admin-links' },
-                            React.createElement('a', { 
+                        e('div', { className: 'admin-links' },
+                            e('a', { 
                                 href: 'http://localhost:8002', 
                                 target: '_blank',
                                 className: 'admin-link'
                             }, '🔧 Admin Panel'),
-                            React.createElement('a', { 
-                                href: 'http://localhost:8001', 
+                            e('a', { 
+                                href: CHAINLIT_URL, 
                                 target: '_blank',
                                 className: 'admin-link'
                             }, '💬 Direct Chat'),
-                            React.createElement('a', { 
-                                href: 'http://localhost:5000/api/embedding-info', 
+                            e('a', { 
+                                href: `${API_BASE_URL}/api/embedding-info`, 
                                 target: '_blank',
                                 className: 'admin-link'
                             }, '⚡ Model Info')
@@ -852,35 +850,34 @@
                     )
                 );
             }
-
-            return React.createElement('div', { className: 'chat-container' },
-                React.createElement('div', { className: 'chat-header' },
-                    React.createElement('h1', null, 'FAQ Assistant'),
-                    React.createElement('div', { className: 'user-info' },
-                        React.createElement('span', null, `Welcome, ${user?.email || 'Guest'}`),
-                        React.createElement('span', null, `Company: ${user?.company_name || 'Unknown'}`),
-                        React.createElement('button', {
+            
+            return e('div', { className: 'chat-container' },
+                e('div', { className: 'chat-header' },
+                    e('h1', null, 'FAQ Assistant'),
+                    e('div', { className: 'user-info' },
+                        e('span', null, `Welcome, ${user?.email || 'Guest'}`),
+                        e('span', null, `Company: ${user?.company_name || 'Unknown'}`),
+                        e('button', {
                             onClick: logout,
                             className: 'logout-button'
                         }, 'Logout')
                     )
                 ),
-                React.createElement('div', { className: 'copilot-container' },
-                    React.createElement('button', {
+                e('div', { className: 'copilot-container' },
+                    e('button', {
                         className: `copilot-button ${!copilotOpen ? 'pulse' : ''}`,
                         onClick: toggleCopilot
                     }, copilotOpen ? '✕ Close Chat' : '🤖 Open AI Assistant'),
-                    
                     copilotOpen && (
                         copilotError ? 
-                            React.createElement('div', { 
+                            e('div', { 
                                 className: 'copilot-iframe',
                                 style: { display: 'flex' }
                             },
-                                React.createElement('div', { className: 'copilot-error' },
-                                    React.createElement('h3', null, 'Connection Error'),
-                                    React.createElement('p', null, copilotError),
-                                    React.createElement('button', {
+                                e('div', { className: 'copilot-error' },
+                                    e('h3', null, 'Connection Error'),
+                                    e('p', null, copilotError),
+                                    e('button', {
                                         className: 'retry-button',
                                         onClick: () => {
                                             setCopilotError(null);
@@ -893,19 +890,19 @@
                                 )
                             ) :
                             copilotLoading ?
-                                React.createElement('div', { 
+                                e('div', { 
                                     className: 'copilot-iframe',
                                     style: { display: 'flex' }
                                 },
-                                    React.createElement('div', { className: 'copilot-loading' },
-                                        React.createElement('div', { className: 'spinner' }),
-                                        React.createElement('p', null, 'Loading AI Assistant...'),
-                                        React.createElement('p', { style: { fontSize: '12px', marginTop: '8px' } }, 
-                                            'Connecting to Chainlit server on port 8001'
+                                    e('div', { className: 'copilot-loading' },
+                                        e('div', { className: 'spinner' }),
+                                        e('p', null, 'Loading AI Assistant...'),
+                                        e('p', { style: { fontSize: '12px', marginTop: '8px' } }, 
+                                            'Connecting to Chainlit server'
                                         )
                                     )
                                 ) :
-                                React.createElement('iframe', {
+                                e('iframe', {
                                     ref: copilotRef,
                                     className: 'copilot-iframe',
                                     title: 'FAQ Assistant AI Chat',
@@ -916,36 +913,34 @@
                 )
             );
         };
-
+        
         // Main App Component
         const App = () => {
             const [isSignup, setIsSignup] = useState(false);
             const { user, loading } = useContext(AuthContext);
-
+            
             if (loading) {
-                return React.createElement('div', { className: 'loading-container' },
-                    React.createElement('div', { className: 'loading-spinner' }),
-                    React.createElement('p', null, 'Loading FAQ Assistant...')
+                return e('div', { className: 'loading-container' },
+                    e('div', { className: 'loading-spinner' }),
+                    e('p', null, 'Loading FAQ Assistant...')
                 );
             }
-
+            
             if (user) {
-                return React.createElement(ChatPage);
+                return e(ChatPage);
             }
-
+            
             return isSignup ? 
-                React.createElement(SignupPage, { onSwitchToLogin: () => setIsSignup(false) }) :
-                React.createElement(LoginPage, { onSwitchToSignup: () => setIsSignup(true) });
+                e(SignupPage, { onSwitchToLogin: () => setIsSignup(false) }) :
+                e(LoginPage, { onSwitchToSignup: () => setIsSignup(true) });
         };
-
+        
         // Root App with Provider
-        const AppWithProvider = () => React.createElement(AuthProvider, null,
-            React.createElement(App)
-        );
-
+        const AppWithProvider = () => e(AuthProvider, null, e(App));
+        
         // Render the app
         const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(React.createElement(AppWithProvider));
+        root.render(e(AppWithProvider));
     </script>
 </body>
 </html>

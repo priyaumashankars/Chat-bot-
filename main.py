@@ -211,15 +211,18 @@ async def init_auth_tables():
                 )
             """)
             
-            # Create users table (consistent naming)
+            # Create users table with identifier column for Chainlit compatibility
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
+                    identifier VARCHAR(255) UNIQUE,
                     email VARCHAR(255) UNIQUE NOT NULL,
                     password_hash VARCHAR(255) NOT NULL,
                     company_id INTEGER REFERENCES companies(id),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active BOOLEAN DEFAULT TRUE
+                    last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    metadata JSONB DEFAULT '{}'::jsonb
                 )
             """)
             
@@ -280,6 +283,7 @@ async def init_auth_tables():
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_faq_data_company_id ON faq_data(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_data_company_id ON doc_data(company_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_identifier ON users(identifier)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_company_id ON chat_sessions(company_id)")
             
             # Insert default companies if none exist
@@ -299,28 +303,34 @@ async def init_auth_tables():
             raise
 
 def generate_token(user_id, company_id, email=None):
-    """Generate JWT token with proper payload structure"""
+    """Generate JWT token with proper payload structure for Chainlit compatibility"""
     payload = {
-        'sub': user_id,
+        'sub': str(user_id),  # Ensure it's a string
         'user_id': user_id,
         'email': email,
         'company_id': company_id,
+        'role': 'user',
         'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24),
         'iat': datetime.datetime.utcnow(),
+        'type': 'access',
         'embedding_model': 'static-retrieval-mrl-en-v1'
     }
     return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
 
 def verify_token(token):
-    """Verify JWT token"""
+    """Verify JWT token with better error handling"""
     try:
         payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        print(f"✅ Token verified successfully for user: {payload.get('email', payload.get('sub'))}")
         return payload
     except jwt.ExpiredSignatureError:
-        print("Token expired")
+        print("❌ Token expired")
         return None
     except jwt.InvalidTokenError as e:
-        print(f"Invalid token: {e}")
+        print(f"❌ Invalid token: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Token verification error: {e}")
         return None
 
 def get_token_from_request():
@@ -352,6 +362,7 @@ def async_flask(f):
             return app_loop.run_until_complete(f(*args, **kwargs))
         except Exception as e:
             print(f"Error in async route: {e}")
+            traceback.print_exc()
             raise
     
     return wrapper
@@ -370,13 +381,14 @@ async def get_company_by_code(company_code):
             return None
 
 async def create_user(email, password_hash, company_id):
-    """Create new user in database"""
+    """Create new user in database with identifier for Chainlit compatibility"""
     async with get_db_connection_context() as conn:
         try:
             user_id = await conn.fetchval("""
-                INSERT INTO users (email, password_hash, company_id)
-                VALUES ($1, $2, $3) RETURNING id
-            """, email, password_hash, company_id)
+                INSERT INTO users (identifier, email, password_hash, company_id, metadata)
+                VALUES ($1, $2, $3, $4, $5) RETURNING id
+            """, email, email, password_hash, company_id, json.dumps({}))
+            print(f"✅ User created with ID: {user_id}")
             return user_id
         except Exception as e:
             print(f"Error creating user: {e}")
@@ -387,7 +399,7 @@ async def get_user_by_email(email):
     async with get_db_connection_context() as conn:
         try:
             user = await conn.fetchrow("""
-                SELECT id, email, password_hash, company_id, is_active
+                SELECT id, identifier, email, password_hash, company_id, is_active
                 FROM users WHERE email = $1
             """, email)
             return dict(user) if user else None
@@ -400,11 +412,12 @@ async def get_user_with_company(user_id):
     async with get_db_connection_context() as conn:
         try:
             user = await conn.fetchrow("""
-                SELECT u.id, u.email, u.company_id, c.name as company_name, c.code as company_code
+                SELECT u.id, u.identifier, u.email, u.company_id, 
+                       c.name as company_name, c.code as company_code
                 FROM users u
                 JOIN companies c ON u.company_id = c.id
                 WHERE u.id = $1 AND u.is_active = true
-            """, user_id)
+            """, int(user_id))
             return dict(user) if user else None
         except Exception as e:
             print(f"Error getting user with company: {e}")
@@ -484,10 +497,13 @@ async def search_faqs_by_embedding(query, company_id):
 
 # ====== AUTHENTICATION ENDPOINTS ======
 
-@app.route('/api/signup', methods=['POST'])
+@app.route('/api/signup', methods=['POST', 'OPTIONS'])
 @async_flask
 async def signup():
     """Signup endpoint with proper connection handling"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         data = request.get_json()
         if not data:
@@ -542,10 +558,13 @@ async def signup():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/login', methods=['POST'])
+@app.route('/api/login', methods=['POST', 'OPTIONS'])
 @async_flask
 async def login():
     """Login endpoint with proper connection handling"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         data = request.get_json()
         if not data:
@@ -570,8 +589,14 @@ async def login():
             print(f"❌ Invalid password for: {email}")
             return jsonify({'error': 'Invalid credentials'}), 401
         
-        # Get company info
+        # Update last login
         async with get_db_connection_context() as conn:
+            await conn.execute(
+                "UPDATE users SET last_login = $1 WHERE id = $2",
+                datetime.datetime.utcnow(), user['id']
+            )
+            
+            # Get company info
             company = await conn.fetchrow("SELECT name, code FROM companies WHERE id = $1", user['company_id'])
             company = dict(company) if company else {'name': 'Unknown', 'code': 'unknown'}
         
@@ -599,23 +624,36 @@ async def login():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/verify-token', methods=['GET'])
+@app.route('/api/verify-token', methods=['GET', 'OPTIONS'])
 @async_flask
 async def verify_token_route():
     """Verify token endpoint with proper connection handling"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         token = get_token_from_request()
+        print(f"🔍 Token verification request. Token present: {bool(token)}")
+        
         if not token:
+            print("❌ No token provided in request")
             return jsonify({'error': 'Token is missing'}), 401
             
         payload = verify_token(token)
         if not payload:
+            print("❌ Token verification failed")
             return jsonify({'error': 'Token is invalid or expired'}), 401
         
+        user_id = payload.get('user_id') or payload.get('sub')
+        print(f"🔍 Getting user info for ID: {user_id}")
+        
         # Get fresh user info
-        user_info = await get_user_with_company(payload['user_id'])
+        user_info = await get_user_with_company(int(user_id))
         if not user_info:
+            print(f"❌ User not found for ID: {user_id}")
             return jsonify({'error': 'User not found'}), 404
+        
+        print(f"✅ Token verification successful for: {user_info['email']}")
         
         return jsonify({
             'valid': True,
@@ -624,13 +662,17 @@ async def verify_token_route():
         })
         
     except Exception as e:
-        print(f"Token verification error: {e}")
+        print(f"❌ Token verification error: {e}")
+        traceback.print_exc()
         return jsonify({'error': 'Internal server error'}), 500
 
-@app.route('/api/chainlit-auth', methods=['GET', 'POST'])
+@app.route('/api/chainlit-auth', methods=['GET', 'POST', 'OPTIONS'])
 @async_flask
 async def chainlit_auth():
     """Chainlit auth endpoint with proper connection handling"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         token = get_token_from_request()
         
@@ -646,7 +688,7 @@ async def chainlit_auth():
         
         print(f"🔍 Chainlit auth for user_id: {user_id}, email: {user_email}")
         
-        user_info = await get_user_with_company(user_id)
+        user_info = await get_user_with_company(int(user_id))
         if not user_info:
             return jsonify({'error': 'User not found'}), 404
         
@@ -672,10 +714,13 @@ async def chainlit_auth():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/search', methods=['POST'])
+@app.route('/api/search', methods=['POST', 'OPTIONS'])
 @async_flask
 async def search():
     """Search endpoint with proper connection handling"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         token = get_token_from_request()
         if not token:
@@ -709,10 +754,13 @@ async def search():
         print(f"Search error: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/company-stats', methods=['GET'])
+@app.route('/api/company-stats', methods=['GET', 'OPTIONS'])
 @async_flask
 async def company_stats():
     """Company stats endpoint with proper connection handling"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         token = get_token_from_request()
         if not token:
@@ -802,7 +850,18 @@ def not_found(error):
 @app.errorhandler(500)
 def internal_error(error):
     """Handle 500 errors"""
+    print(f"Internal server error: {error}")
     return jsonify({'error': 'Internal server error'}), 500
+
+# Handle CORS preflight requests
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = jsonify({})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "*")
+        response.headers.add('Access-Control-Allow-Methods', "*")
+        return response
 
 # Cleanup function for application shutdown
 async def cleanup():
@@ -829,6 +888,8 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"❌ Database initialization error: {e}")
         print("Please check your DATABASE_URL in .env file")
+        print("Make sure PostgreSQL is running and the database exists")
+        exit(1)
     
     print("🚀 Flask server starting...")
     print(f"📍 Access the app at: http://localhost:5000")
@@ -837,11 +898,24 @@ if __name__ == '__main__':
     print(f"⚡ Embedding Model: static-retrieval-mrl-en-v1 (100x-400x faster on CPU!)")
     print(f"🔗 Chainlit: {CHAINLIT_SERVER_URL}")
     print("🔐 Authentication system ready!")
+    print("\n" + "="*60)
+    print("SETUP INSTRUCTIONS:")
+    print("1. Start this Flask server: python main.py")
+    print("2. Start Chainlit server: python your_chainlit_app.py")
+    print("3. Open your HTML file in a web server")
+    print("4. Use company codes: 'default', 'demo', or 'test'")
+    print("="*60 + "\n")
     
     try:
-        app.run(debug=True, port=5000, host='0.0.0.0')
+        app.run(debug=True, port=5000, host='0.0.0.0', threaded=True)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down gracefully...")
     finally:
         # Ensure cleanup on shutdown
-        app_loop.run_until_complete(cleanup())
-        if not app_loop.is_closed():
-            app_loop.close()
+        try:
+            app_loop.run_until_complete(cleanup())
+        except:
+            pass
+        finally:
+            if not app_loop.is_closed():
+                app_loop.close()
